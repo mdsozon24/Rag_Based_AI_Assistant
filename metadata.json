@@ -1,0 +1,6 @@
+{
+  "name": "Bangladeshi Bangla Voice AI Agent",
+  "description": "A Bangladeshi Bangla voice AI agent powered by Gemini, featuring a streamlined voice button, RAG file upload support, and a standalone Python implementation.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
