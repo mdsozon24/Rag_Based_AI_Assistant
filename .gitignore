@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 data/users.json
+data/custom_documents.json
+data/user_data/

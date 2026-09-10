@@ -2,11 +2,9 @@
 <img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
 </div>
 
-# Run and deploy your AI Studio app
+# BN AI Assistant
 
 This contains everything you need to run your app locally.
-
-View your app in AI Studio: https://ai.studio/apps/633cb63f-c0c5-4599-850d-2529d2fb23a2
 
 ## Run Locally
 
@@ -37,3 +35,24 @@ APP_URL=https://your-domain.example
 ```
 
 Without SMTP configuration, password reset requests cannot send email. The server stores accounts in `data/users.json`; keep that file private and back it up securely.
+
+## Deploy to Render
+
+This project is deployed as one Render Web Service. The Express server serves the built Vite frontend and the `/api/*` endpoints, while the same process handles the `/ws/live` WebSocket connection.
+
+1. Push this repository to GitHub. Do not commit `.env`, API keys, or private files from `data/`.
+2. In Render, choose **New > Blueprint** and select the repository. Render will read `render.yaml`.
+3. Enter the secret value for `GEMINI_API_KEY` and deploy.
+4. Set `APP_URL` to the generated Render URL, for example `https://bn-ai-assistant.onrender.com`.
+5. If password reset is required, enter the `SMTP_*` values in the Render Environment settings.
+6. Verify `https://your-app.onrender.com/api/health` returns `{ "status": "ok" }`.
+
+The production commands are:
+
+```text
+Build: npm install && npm run build
+Start: npm start
+Health check: /api/health
+```
+
+The free Render filesystem is ephemeral. Accounts, uploaded documents, and voice memories stored under `data/` can be lost after a restart or redeploy. For persistent data, migrate these files to a database and object storage before using the app in production.
