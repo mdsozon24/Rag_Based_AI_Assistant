@@ -12,6 +12,7 @@ interface EmbeddedDoc extends KnowledgeDocument {
 const DATA_DIR = path.join(process.cwd(), 'data');
 const STORED_DOCS_PATH = path.join(DATA_DIR, 'custom_documents.json');
 const USER_DATA_DIR = path.join(DATA_DIR, 'user_data');
+export const SHARED_OWNER_ID = '__shared__';
 
 export class RagEngine {
   private documents: EmbeddedDoc[] = [];
@@ -42,6 +43,10 @@ export class RagEngine {
           const documentsByUser = new Map<string, EmbeddedDoc[]>();
           for (const document of parsed) {
             if (!document.ownerUserId) continue;
+            if (document.ownerUserId === SHARED_OWNER_ID) {
+              this.documents.push({ ...document, isCustom: true } as EmbeddedDoc);
+              continue;
+            }
             const userDocuments = documentsByUser.get(document.ownerUserId) || [];
             userDocuments.push({ ...document, isCustom: true } as EmbeddedDoc);
             documentsByUser.set(document.ownerUserId, userDocuments);
@@ -64,14 +69,22 @@ export class RagEngine {
   }
 
   private syncLegacyDocumentFile(): void {
-    const allCustomDocuments: EmbeddedDoc[] = [];
+    const allCustomDocuments: EmbeddedDoc[] = this.documents.filter(
+      (document) => document.isCustom && document.ownerUserId === SHARED_OWNER_ID
+    );
+    const documentIds = new Set(allCustomDocuments.map((document) => document.id));
     if (fs.existsSync(USER_DATA_DIR)) {
       for (const fileName of fs.readdirSync(USER_DATA_DIR)) {
         if (!fileName.endsWith('.json')) continue;
         try {
           const userData = JSON.parse(fs.readFileSync(path.join(USER_DATA_DIR, fileName), 'utf8'));
           if (Array.isArray(userData.documents)) {
-            allCustomDocuments.push(...userData.documents.filter((document: EmbeddedDoc) => document.isCustom));
+            for (const document of userData.documents.filter((document: EmbeddedDoc) => document.isCustom)) {
+              if (!documentIds.has(document.id)) {
+                allCustomDocuments.push(document);
+                documentIds.add(document.id);
+              }
+            }
           }
         } catch (error) {
           console.warn(`[RAG Engine] Could not sync ${fileName}:`, error);
@@ -88,7 +101,7 @@ export class RagEngine {
     try {
       const documentsByUser = new Map<string, EmbeddedDoc[]>();
       for (const doc of this.documents) {
-        if (!doc.isCustom || !doc.ownerUserId) continue;
+        if (!doc.isCustom || !doc.ownerUserId || doc.ownerUserId === SHARED_OWNER_ID) continue;
         const userDocuments = documentsByUser.get(doc.ownerUserId) || [];
         userDocuments.push(doc);
         documentsByUser.set(doc.ownerUserId, userDocuments);
@@ -112,7 +125,9 @@ export class RagEngine {
   }
 
   private async ensureUserEmbeddings(ownerUserId: string): Promise<void> {
-    const userDocuments = this.documents.filter((doc) => doc.isCustom && doc.ownerUserId === ownerUserId && !doc.vector);
+    const userDocuments = this.documents.filter(
+      (doc) => doc.isCustom && (doc.ownerUserId === SHARED_OWNER_ID || doc.ownerUserId === ownerUserId) && !doc.vector
+    );
     for (const document of userDocuments) {
       await this.embedSingleDoc(document);
     }
@@ -125,7 +140,7 @@ export class RagEngine {
   public getAllDocuments(ownerUserId?: string): KnowledgeDocument[] {
     if (ownerUserId) this.loadUserDocuments(ownerUserId);
     return this.documents
-      .filter(d => !d.isCustom || d.ownerUserId === ownerUserId)
+      .filter(d => !d.isCustom || d.ownerUserId === SHARED_OWNER_ID || d.ownerUserId === ownerUserId)
       .map(d => ({
       id: d.id,
       title: d.title,
@@ -142,7 +157,7 @@ export class RagEngine {
   public getCustomDocuments(ownerUserId?: string): KnowledgeDocument[] {
     if (ownerUserId) this.loadUserDocuments(ownerUserId);
     return this.documents
-      .filter(d => d.isCustom && d.ownerUserId === ownerUserId)
+      .filter(d => d.isCustom && (d.ownerUserId === SHARED_OWNER_ID || d.ownerUserId === ownerUserId))
       .map(d => ({
         id: d.id,
         title: d.title,
@@ -154,6 +169,17 @@ export class RagEngine {
         isCustom: d.isCustom,
         createdAt: d.createdAt
       }));
+  }
+
+  public getAllCustomDocuments(): KnowledgeDocument[] {
+    if (!fs.existsSync(STORED_DOCS_PATH)) return [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(STORED_DOCS_PATH, 'utf8')) as KnowledgeDocument[];
+      return Array.isArray(parsed) ? parsed.filter((document) => document.isCustom) : [];
+    } catch (error) {
+      console.warn('[RAG Engine] Could not load universal custom documents:', error);
+      return [];
+    }
   }
 
   public addDocument(doc: Omit<KnowledgeDocument, 'id' | 'createdAt'>, ownerUserId: string): KnowledgeDocument {
@@ -274,7 +300,7 @@ export class RagEngine {
     const scoredDocs: { doc: KnowledgeDocument; score: number }[] = [];
 
     for (const doc of this.documents) {
-      if (doc.isCustom && doc.ownerUserId !== ownerUserId) continue;
+      if (doc.isCustom && doc.ownerUserId !== SHARED_OWNER_ID && doc.ownerUserId !== ownerUserId) continue;
       if (category && category !== 'all' && doc.category !== category) {
         continue;
       }

@@ -33,6 +33,26 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState<string>('কথা বলতে বোতামে চাপ দিন');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const readJsonResponse = async <T,>(response: Response, fallbackMessage: string): Promise<T> => {
+    const rawText = await response.text();
+    if (!rawText) {
+      throw new Error(fallbackMessage);
+    }
+
+    try {
+      return JSON.parse(rawText) as T;
+    } catch {
+      const trimmed = rawText.replace(/\s+/g, ' ').slice(0, 220);
+      const contentType = response.headers.get('content-type') || '';
+      const serverHint = contentType.includes('text/html')
+        ? 'The server responded with HTML instead of JSON. The backend may be offline or still starting.'
+        : trimmed
+          ? `Server returned a non-JSON response: ${trimmed}`
+          : fallbackMessage;
+      throw new Error(serverHint);
+    }
+  };
+
   // File Upload for RAG state
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
@@ -47,6 +67,7 @@ export default function App() {
 
   // Audio Playback Player (24kHz for Gemini Live & Speech Audio)
   const pcmPlayerRef = useRef<GaplessPcmPlayer | null>(null);
+  const mp3AudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Live WebSocket & Media Stream references
   const liveWsRef = useRef<WebSocket | null>(null);
@@ -66,7 +87,7 @@ export default function App() {
     try {
       const res = await fetch('/api/rag/custom-documents');
       if (res.ok) {
-        const data = await res.json();
+        const data = await readJsonResponse<{ documents?: KnowledgeDocument[] }>(res, 'Stored documents could not be loaded.');
         setStoredDocs(data.documents || []);
       }
     } catch (e) {
@@ -75,10 +96,14 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetch('/api/auth/me').then((res) => res.json()).then((data) => {
-      setUser(data.user || null);
-      if (data.user) fetchStoredDocuments();
-    }).catch(() => setUser(null)).finally(() => setAuthChecked(true));
+    fetch('/api/auth/me')
+      .then(async (res) => {
+        const data = await readJsonResponse<{ user?: { id: string; email: string; createdAt: string } | null }>(res, 'Authentication state could not be loaded.');
+        setUser(data.user || null);
+        if (data.user) fetchStoredDocuments();
+      })
+      .catch(() => setUser(null))
+      .finally(() => setAuthChecked(true));
     pcmPlayerRef.current = new GaplessPcmPlayer(24000);
     pcmPlayerRef.current.setOnEnded(() => {
       setVoiceState((current) => (current === 'speaking' ? 'listening' : current));
@@ -108,10 +133,6 @@ export default function App() {
       clearTimeout(liveReconnectTimerRef.current);
       liveReconnectTimerRef.current = null;
     }
-    if (micMediaStreamRef.current) {
-      micMediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      micMediaStreamRef.current = null;
-    }
     if (scriptProcessorRef.current) {
       scriptProcessorRef.current.disconnect();
       scriptProcessorRef.current = null;
@@ -133,8 +154,17 @@ export default function App() {
         // ignore
       }
     }
+    if (micMediaStreamRef.current) {
+      micMediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      micMediaStreamRef.current = null;
+    }
     if (pcmPlayerRef.current) {
       pcmPlayerRef.current.stop();
+    }
+    if (mp3AudioRef.current) {
+      mp3AudioRef.current.pause();
+      mp3AudioRef.current.currentTime = 0;
+      mp3AudioRef.current = null;
     }
     setVoiceState('idle');
     setVolumeLevel(0);
@@ -166,7 +196,8 @@ export default function App() {
       if (!pcmPlayerRef.current) {
         pcmPlayerRef.current = new GaplessPcmPlayer(24000);
       }
-      await pcmPlayerRef.current.resume();
+      const pcmPlayer = pcmPlayerRef.current;
+      await pcmPlayer.resume();
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws/live`;
@@ -299,7 +330,13 @@ export default function App() {
 
       recorder.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
+        mediaRecorderRef.current = null;
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+        if (audioBlob.size === 0) {
+          setErrorMessage('কোনো অডিও রেকর্ড হয়নি। আবার চেষ্টা করুন।');
+          setVoiceState('idle');
+          return;
+        }
         setStatusMessage('প্রক্রিয়াকরণ হচ্ছে...');
         setVoiceState('connecting');
 
@@ -314,7 +351,13 @@ export default function App() {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ audioBase64: base64Data, mimeType }),
             });
-            const transData = await transRes.json();
+            const transData = await readJsonResponse<{ text?: string; error?: string }>(
+              transRes,
+              'কণ্ঠের কথা শনাক্ত করা যায়নি। সার্ভার উত্তর দিচ্ছে না।',
+            );
+            if (!transRes.ok) {
+              throw new Error(transData.error || 'কণ্ঠের কথা শনাক্ত করা যায়নি');
+            }
             const transcribed = transData.text;
 
             if (!transcribed) {
@@ -329,26 +372,64 @@ export default function App() {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ message: transcribed, mode: selectedMode, voiceName: 'Kore', enableRag: true }),
             });
-            const queryData = await queryRes.json();
+            const queryData = await readJsonResponse<{ text?: string; error?: string; audioBase64?: string; audioMimeType?: string }>(
+              queryRes,
+              'এআই উত্তর তৈরি করা যায়নি। সার্ভার না থাকলে আবার চেষ্টা করুন।',
+            );
+            if (!queryRes.ok) {
+              throw new Error(queryData.error || 'উত্তর তৈরি করা যায়নি');
+            }
 
             if (queryData.audioBase64) {
               setVoiceState('speaking');
               setStatusMessage('এআই উত্তর দিচ্ছে...');
-              await pcmPlayerRef.current?.resume();
-              pcmPlayerRef.current?.queuePcmBase64(queryData.audioBase64);
+              const audio = new Audio(`data:${queryData.audioMimeType || 'audio/mpeg'};base64,${queryData.audioBase64}`);
+              mp3AudioRef.current = audio;
+              audio.onended = () => {
+                mp3AudioRef.current = null;
+                setVoiceState('idle');
+                setStatusMessage('কথা বলতে বোতামে চাপ দিন');
+              };
+              await audio.play().catch((playError) => {
+                throw new Error(`অডিও চালু করা যায়নি: ${playError?.message || 'ব্রাউজার অডিও অনুমতি দেয়নি'}`);
+              });
+            } else if (queryData.text) {
+              const ttsRes = await fetch('/api/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: queryData.text }),
+              });
+              const ttsData = await readJsonResponse<{ audioBase64?: string; error?: string; mimeType?: string }>(
+                ttsRes,
+                'Gemini কণ্ঠ তৈরি করা যায়নি। সার্ভার উত্তর দিচ্ছে না।',
+              );
+              if (!ttsRes.ok || !ttsData.audioBase64) {
+                throw new Error(ttsData.error || 'Gemini কণ্ঠ তৈরি করা যায়নি');
+              }
+              setVoiceState('speaking');
+              setStatusMessage('এআই উত্তর দিচ্ছে...');
+              const audio = new Audio(`data:${ttsData.mimeType || 'audio/mpeg'};base64,${ttsData.audioBase64}`);
+              mp3AudioRef.current = audio;
+              audio.onended = () => {
+                mp3AudioRef.current = null;
+                setVoiceState('idle');
+                setStatusMessage('কথা বলতে বোতামে চাপ দিন');
+              };
+              await audio.play();
             } else {
               setStatusMessage(queryData.text ? queryData.text.slice(0, 80) : 'সম্পন্ন');
               setVoiceState('idle');
             }
           } catch (e: any) {
-            setErrorMessage('অনুরোধ সম্পন্ন করা যায়নি');
+            console.error('Voice request failed:', e);
+            setErrorMessage(e?.message || 'অনুরোধ সম্পন্ন করা যায়নি');
             setVoiceState('idle');
           }
         };
       };
 
-      recorder.start();
       mediaRecorderRef.current = recorder;
+      recorder.start(250);
     } catch (e: any) {
       setErrorMessage('মাইক্রোফোন চালু করা যায়নি');
       setVoiceState('idle');
@@ -408,7 +489,7 @@ export default function App() {
             }),
           });
 
-          const data = await response.json();
+          const data = await readJsonResponse<{ error?: string }>(response, 'Upload failed because the server did not return a valid JSON response.');
           if (!response.ok) {
             throw new Error(data.error || 'Upload failed');
           }

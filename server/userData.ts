@@ -66,6 +66,21 @@ export function getUserMemories(userId: string) {
   return loadUserData(userId).memories;
 }
 
+export function getAllStoredUserMemories(): UserMemoryRecord[] {
+  if (!fs.existsSync(USER_DATA_DIR)) return [];
+  const memories: UserMemoryRecord[] = [];
+  for (const fileName of fs.readdirSync(USER_DATA_DIR)) {
+    if (!fileName.endsWith('.json')) continue;
+    const userId = fileName.slice(0, -'.json'.length);
+    try {
+      memories.push(...loadUserData(userId).memories);
+    } catch (error) {
+      console.warn(`[User data] Could not load memories from ${fileName}:`, error);
+    }
+  }
+  return memories;
+}
+
 interface VoiceMemoryDraft {
   important: boolean;
   summary: string;

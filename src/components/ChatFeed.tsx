@@ -43,8 +43,7 @@ export const ChatFeed: React.FC<ChatFeedProps> = ({
           স্বাগতম! আমি আপনার বাংলাদেশি বাংলা ভয়েস এআই সহকারী
         </h2>
         <p className="text-sm text-slate-400 max-w-lg mb-6 leading-relaxed">
-          যেকোনো প্রশ্ন বাংলায় জিজ্ঞাসা করুন বা মাইক্রোফোনে কথা বলুন। RAG তথ্যভাণ্ডারের সাহায্যে বাংলাদেশের সরকারি সেবা, সংবিধান, মেগা প্রকল্প, কৃষি ও সংস্কৃতির নিখুঁত উত্তর ও সরাসরি কণ্ঠস্বর পাবেন।
-        </p>
+          যেকোনো প্রশ্ন বাংলায় জিজ্ঞাসা করুন বা মাইক্রোফোনে কথা বলুন।</p>
 
         {/* Suggested Quick Prompts */}
         <div className="w-full max-w-2xl">
@@ -159,13 +158,13 @@ export const ChatFeed: React.FC<ChatFeedProps> = ({
                     ) : (
                       <>
                         <Volume2 className="w-3.5 h-3.5" />
-                        <span>কণ্ঠে শুনুন (Gemini TTS)</span>
+                        <span>কণ্ঠে শুনুন (Gemini)</span>
                       </>
                     )}
                   </button>
 
                   <span className="text-[11px] text-slate-400">
-                    24kHz HD Audio
+                    Gemini HD Audio
                   </span>
                 </div>
               )}

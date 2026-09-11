@@ -14,7 +14,14 @@ This contains everything you need to run your app locally.
 1. Install dependencies:
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+3. Set `ADMIN_EMAILS` to a comma-separated list of administrator email addresses:
+
+```text
+ADMIN_EMAILS=admin@example.com
+```
+
+Administrator uploads and important voice statements are stored as shared knowledge in `data/custom_documents.json` and are available to every signed-in user. Regular user uploads and personal voice memories remain private.
+4. Run the app:
    `npm run dev`
 
 The development server runs at `http://localhost:3100` by default. Set `PORT` in `.env` to use another port.

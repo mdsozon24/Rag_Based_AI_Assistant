@@ -11,6 +11,14 @@ export interface AuthUser {
   createdAt: string;
 }
 
+export function isAdminUser(user: AuthUser): boolean {
+  const adminEmails = (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((email) => normalizeEmail(email))
+    .filter(Boolean);
+  return adminEmails.includes(user.email);
+}
+
 interface ResetToken {
   userId: string;
   expiresAt: number;
@@ -63,7 +71,9 @@ function parseCookies(header = '') {
   }).filter(([key]) => key));
 }
 
-export function publicUser(user: AuthUser) { return { id: user.id, email: user.email, createdAt: user.createdAt }; }
+export function publicUser(user: AuthUser) {
+  return { id: user.id, email: user.email, createdAt: user.createdAt, isAdmin: isAdminUser(user) };
+}
 
 export function register(emailInput: unknown, password: unknown) {
   const email = typeof emailInput === 'string' ? normalizeEmail(emailInput) : '';
@@ -74,7 +84,9 @@ export function register(emailInput: unknown, password: unknown) {
   const user: AuthUser = { id: crypto.randomUUID(), email, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
   users.push(user);
   saveUsers(users);
-  ensureUserDataFile(user.id);
+  if (!isAdminUser(user)) {
+    ensureUserDataFile(user.id);
+  }
   return user;
 }
 
@@ -84,7 +96,9 @@ export function login(emailInput: unknown, password: unknown) {
   if (!user || typeof password !== 'string' || !verifyPassword(password, user.passwordHash)) {
     throw new Error('Email or password is incorrect.');
   }
-  ensureUserDataFile(user.id);
+  if (!isAdminUser(user)) {
+    ensureUserDataFile(user.id);
+  }
   return user;
 }
 

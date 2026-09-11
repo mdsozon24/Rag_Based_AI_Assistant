@@ -5,16 +5,101 @@ import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality, ThinkingLevel, LiveServerMessage } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { RagEngine } from './server/rag.ts';
+import { RagEngine, SHARED_OWNER_ID } from './server/rag.ts';
 import { extractTextFromPdfBuffer, generateContentWithFallback } from './server/fileProcessor.ts';
-import { clearSessionCookie, createSession, getUserFromRequest, login, logout, publicUser, register, requestPasswordReset, resetPassword, sessionCookie } from './server/auth.ts';
-import { getUserMemories, storeImportantVoiceData } from './server/userData.ts';
+import { clearSessionCookie, createSession, getUserFromRequest, isAdminUser, login, logout, publicUser, register, requestPasswordReset, resetPassword, sessionCookie } from './server/auth.ts';
+import { getAllStoredUserMemories, getUserMemories, storeImportantVoiceData } from './server/userData.ts';
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3100);
 const app = express();
 const server = http.createServer(app);
+const BENGALI_GREETING = 'আসসালামু আলাইকুম। আপনাকে আন্তরিক স্বাগতম। আমি কীভাবে আপনাকে সাহায্য করতে পারি?';
+
+function enforceBanglaGreeting(text: string): string {
+  const cleaned = (text || '').replace(/\[(.*?)\]|\*\*|\*|_+|`+|#+|>+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return BENGALI_GREETING;
+
+  const startsWithGreeting = /আসসালামু|স্বাগতম/i.test(cleaned.slice(0, 120));
+  if (startsWithGreeting) {
+    return cleaned;
+  }
+
+  return `${BENGALI_GREETING} ${cleaned}`;
+}
+
+function sanitizeSpeechText(text: string): string {
+  const withGreeting = enforceBanglaGreeting(text);
+  const withoutNoise = withGreeting
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s*\n\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\b(?:\*\*|__|##|###)\b/g, '')
+    .replace(/(\s*[-•*]\s*)+/g, ' ')
+    .replace(/(\s*\|\s*)+/g, ' ')
+    .replace(/\s*[:;]+\s*/g, ': ')
+    .trim();
+
+  return withoutNoise.length > 4000 ? withoutNoise.slice(0, 4000).trim() : withoutNoise;
+}
+
+function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bitsPerSample = 16): Buffer {
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+
+  return Buffer.concat([header, pcm]);
+}
+
+async function generateGeminiSpeech(client: GoogleGenAI, text: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  const response = await client.models.generateContent({
+    model: 'gemini-2.5-flash-preview-tts',
+    contents: sanitizeSpeechText(text),
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: 'Kore',
+          },
+        },
+      },
+    },
+  });
+
+  const audioPart = response.candidates?.[0]?.content?.parts?.find((part) => part.inlineData?.data);
+  const audioData = audioPart?.inlineData?.data;
+  if (!audioData) {
+    throw new Error('Gemini TTS returned no audio data.');
+  }
+
+  const sourceMimeType = audioPart.inlineData?.mimeType || 'audio/L16;rate=24000';
+  const audioBuffer = Buffer.from(audioData, 'base64');
+  if (sourceMimeType.toLowerCase().startsWith('audio/wav')) {
+    return { buffer: audioBuffer, mimeType: 'audio/wav' };
+  }
+
+  const sampleRateMatch = sourceMimeType.match(/rate=(\d+)/i);
+  return {
+    buffer: pcmToWav(audioBuffer, sampleRateMatch ? Number(sampleRateMatch[1]) : 24000),
+    mimeType: 'audio/wav',
+  };
+}
 
 
 app.use(express.json({ limit: '50mb' }));
@@ -56,6 +141,16 @@ function requireUser(req: express.Request, res: express.Response) {
   const user = getUserFromRequest(req);
   if (!user) {
     res.status(401).json({ error: 'Please log in to continue.' });
+    return undefined;
+  }
+  return user;
+}
+
+function requireAdmin(req: express.Request, res: express.Response) {
+  const user = requireUser(req, res);
+  if (!user) return undefined;
+  if (!isAdminUser(user)) {
+    res.status(403).json({ error: 'Administrator access is required.' });
     return undefined;
   }
   return user;
@@ -150,7 +245,7 @@ app.post('/api/rag/documents', (req, res) => {
       summary: summary || content.slice(0, 150) + '...',
       tags: Array.isArray(tags) ? tags : [category || 'custom'],
       sourceUrl,
-    }, user.id);
+    }, isAdminUser(user) ? SHARED_OWNER_ID : user.id);
     res.json({ document: newDoc });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to add document' });
@@ -243,7 +338,7 @@ app.post('/api/rag/upload-file', async (req, res) => {
       summary,
       tags: ['uploaded_file', fileName.split('.').pop() || 'file'],
       isCustom: true,
-    }, user.id);
+    }, isAdminUser(user) ? SHARED_OWNER_ID : user.id);
 
     res.json({
       success: true,
@@ -302,10 +397,22 @@ app.post('/api/transcribe', async (req, res) => {
     const transcribedText = response.text?.trim() || '';
     let storedMemory = null;
     if (transcribedText) {
-      try {
-        storedMemory = await storeImportantVoiceData(ai, user.id, transcribedText);
-      } catch (memoryError: any) {
-        console.warn('Voice memory was not stored:', memoryError?.message || memoryError);
+      if (isAdminUser(user)) {
+        ragEngine.addDocument({
+          title: `Admin voice information - ${new Date().toISOString().slice(0, 10)}`,
+          category: 'custom',
+          content: transcribedText,
+          summary: transcribedText.slice(0, 160) + (transcribedText.length > 160 ? '...' : ''),
+          tags: ['admin_voice', 'shared_information'],
+          isCustom: true,
+        }, SHARED_OWNER_ID);
+        storedMemory = true;
+      } else {
+        try {
+          storedMemory = await storeImportantVoiceData(ai, user.id, transcribedText);
+        } catch (memoryError: any) {
+          console.warn('Voice memory was not stored:', memoryError?.message || memoryError);
+        }
       }
     }
     res.json({
@@ -319,52 +426,25 @@ app.post('/api/transcribe', async (req, res) => {
   }
 });
 
-// POST Convert Text to Speech using gemini-3.1-flash-tts-preview
+// POST Convert Text to Speech using Gemini
 app.post('/api/tts', async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
   try {
-    if (!ai) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in server environment.' });
-    }
-    const { text, voiceName = 'Kore' } = req.body;
+    const { text } = req.body;
     if (!text) {
       return res.status(400).json({ error: 'Text is required for TTS' });
     }
 
-    const cleanText = text;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-tts-preview',
-      contents: [
-        {
-          parts: [
-            {
-              text: `বাংলা ভাষা ঠিক মানুষের মত করে স্বাভাবিক ও স্পষ্ট বাচনে বলুন: ${cleanText}`,
-            },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: voiceName || 'Kore',
-            },
-          },
-        },
-      },
-    });
-
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) {
-      return res.status(502).json({ error: 'No audio generated by TTS model' });
+    if (!ai) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in server environment.' });
     }
 
+    const audio = await generateGeminiSpeech(ai, text);
+
     res.json({
-      audioBase64: base64Audio,
-      mimeType: 'audio/pcm;rate=24000',
+      audioBase64: audio.buffer.toString('base64'),
+      mimeType: audio.mimeType,
     });
   } catch (error: any) {
     console.error('TTS error:', error);
@@ -394,8 +474,9 @@ app.post('/api/rag/query', async (req, res) => {
     }
 
     // Always attach user-uploaded and stored files to model context with highest priority
-    const customDocs = ragEngine.getCustomDocuments(user.id);
-    const userMemories = getUserMemories(user.id);
+    const adminAccess = isAdminUser(user);
+    const customDocs = adminAccess ? ragEngine.getAllCustomDocuments() : ragEngine.getCustomDocuments(user.id);
+    const userMemories = adminAccess ? getAllStoredUserMemories() : getUserMemories(user.id);
     let customFilesSection = '';
     if (customDocs.length > 0) {
       customFilesSection =
@@ -422,14 +503,16 @@ app.post('/api/rag/query', async (req, res) => {
     const contextBlock = `${userMemorySection}${customFilesSection}${completeStandardContext ? `\n\n【সম্পূর্ণ সাধারণ রেফারেন্স তথ্যভাণ্ডার】:\n${completeStandardContext}` : ''}`;
 
     const systemInstruction = `তুমি একজন অত্যন্ত পারদর্শী, জ্ঞানী ও নির্ভরযোগ্য বাংলাদেশি বাংলা ভয়েস এআই এজেন্ট (Bangladeshi Bangla Voice AI Agent)।
-    প্রথমে তুমি ইউজারকে স্বাগতম জানাবে এবং তুমি কি হেল্প করতে পারবে সেটা ব্যবহারকারীর কাছ থেকে জানতে চাইবে। 
+    প্রতিটি নতুন কথোপকথনের প্রথম উত্তরের একেবারে শুরুতে অবশ্যই বলবে: "আসসালামু আলাইকুম। আপনাকে আন্তরিক স্বাগতম। আমি কীভাবে আপনাকে সাহায্য করতে পারি?" এরপর ব্যবহারকারীর প্রশ্নের উত্তর দেবে।
 তোমার দায়িত্ব ও নির্দেশনা:
 ১. তুমি একটি AI এর মত কথা না বলে একদম সম্পূর্ণ মানুষের মত করে উত্তর দাও।
-২. ব্যবহারকারী যেসব ফাইল আপলোড করেছেন তার সম্পূর্ণ ডেটা স্থায়ীভাবে সংরক্ষিত রাখা হয়েছে এবং তোমার কাছে সরবরাহ করা হয়েছে। ব্যবহারকারীর প্রশ্ন যদি আপলোডকৃত কোনো ফাইল বা নথির তথ্য সম্পর্কিত হয়, তবে সেই সংরক্ষিত নথির ডেটা সম্পূর্ণভাবে পর্যালোচনা করে সরাসরি ও নির্ভুল প্রমিত বাংলায় উত্তর প্রদান করো।
-৩. যদি সাধারণ রেফারেন্স তথ্যভাণ্ডার (RAG Context) থাকে, সেখান থেকেও প্রাসঙ্গিক তথ্য নিয়ে উত্তর দিতে পারো।
-৪. কোনো তথ্য জানা না থাকলে বানোয়াট কিছু না বলে শান্তভাবে জানিয়ে দাও।
-৫. ব্যবহারকারী যদি নোয়াখালী, চট্টগ্রাম বা সিলেটের আঞ্চলিক উপভাষায় কথা বলেন, তবে তা আন্তরিকভাবে বুঝে প্রমিত বাংলায় প্রাঞ্জল উত্তর দাও।
-৬. উত্তরটি মুখে শোনার (TTS) জন্য অত্যন্ত শ্রুতিমধুর, স্পষ্ট, আকর্ষণীয় ও অনর্থক প্রতীকবিহীন (clean spoken Bengali) করো।`;
+২. প্রথম বাক্যটি সর্বদা বাংলা ভাষায় সালাম ও স্বাগতমের সঙ্গে শুরু করো।
+৩. ব্যবহারকারী যেসব ফাইল আপলোড করেছেন তার সম্পূর্ণ ডেটা স্থায়ীভাবে সংরক্ষিত রাখা হয়েছে এবং তোমার কাছে সরবরাহ করা হয়েছে। ব্যবহারকারীর প্রশ্ন যদি আপলোডকৃত কোনো ফাইল বা নথির তথ্য সম্পর্কিত হয়, তবে সেই সংরক্ষিত নথির ডেটা সম্পূর্ণভাবে পর্যালোচনা করে সরাসরি ও নির্ভুল প্রমিত বাংলায় উত্তর প্রদান করো।
+৪. যদি সাধারণ রেফারেন্স তথ্যভাণ্ডার (RAG Context) থাকে, সেখান থেকেও প্রাসঙ্গিক তথ্য নিয়ে উত্তর দিতে পারো।
+৫. কোনো তথ্য জানা না থাকলে বানোয়াট কিছু না বলে শান্তভাবে জানিয়ে দাও।
+৬. ব্যবহারকারী যদি নোয়াখালী, চট্টগ্রাম বা সিলেটের আঞ্চলিক উপভাষায় কথা বলেন, তবে তা আন্তরিকভাবে বুঝে প্রমিত বাংলায় প্রাঞ্জল উত্তর দাও।
+৭. উত্তরটি মুখে শোনার (TTS) জন্য অত্যন্ত শ্রুতিমধুর, স্পষ্ট, আকর্ষণীয়, স্বাভাবিক ও অনর্থক প্রতীকবিহীন (clean spoken Bengali) করো।
+৮. কোনো Markdown, তালিকা, Asterisk, কমান্ড, code block, বা অনাবশ্যক চিহ্ন ব্যবহার করো না; শুধু স্বাভাবিক কথা বলার ভাষায় লিখবে।`;
 
     const userPrompt = `ব্যবহারকারীর বার্তা বা প্রশ্ন: "${message}"\n\n` +
       (contextBlock ? `${contextBlock}\n\n` : '') +
@@ -441,72 +524,29 @@ app.post('/api/rag/query', async (req, res) => {
 
     if (mode === 'high_thinking') {
       selectedModel = 'gemini-3.1-pro-preview';
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: userPrompt,
-        config: {
-          systemInstruction,
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.HIGH,
-          },
-        },
-      });
-      responseText = result.text || '';
     } else if (mode === 'fast') {
       selectedModel = 'gemini-3.1-flash-lite';
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: userPrompt,
-        config: {
-          systemInstruction,
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL,
-          },
-        },
-      });
-      responseText = result.text || '';
-    } else {
-      selectedModel = 'gemini-3.8-flash';
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: userPrompt,
-        config: {
-          systemInstruction,
-        },
-      });
-      responseText = result.text || '';
     }
 
-    // Generate Audio via gemini-3.1-flash-tts-preview for seamless voice reply
+    responseText = await generateContentWithFallback(ai, {
+      preferredModel: selectedModel,
+      contents: userPrompt,
+      systemInstruction,
+    });
+
+    responseText = enforceBanglaGreeting(responseText);
+
+    // Generate the complete Bengali answer with Gemini TTS. No application-level text cap.
     let audioBase64: string | undefined = undefined;
+    let audioMimeType: string | undefined = undefined;
     try {
-      // Pick first 250 chars of response for instant snappy audio voice reply
-      const speechSummary = responseText.replace(/[*#_`>]/g, '').slice(0, 250);
-      const ttsPromise = ai.models.generateContent({
-        model: 'gemini-3.1-flash-tts-preview',
-        contents: [
-          {
-            parts: [
-              {
-                text: `স্বাভাবিক বাচনে AI এর মত কথা না বলে একদম সম্পূর্ণ মানুষের মত করে বলুন: ${speechSummary}`,
-              },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: voiceName || 'Kore',
-              },
-            },
-          },
-        },
-      });
-      const ttsTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 4000));
+      const ttsPromise = generateGeminiSpeech(ai, responseText);
+      const ttsTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 30000));
       const ttsResult = (await Promise.race([ttsPromise, ttsTimeout])) as any;
-      audioBase64 = ttsResult?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (ttsResult?.buffer && Buffer.isBuffer(ttsResult.buffer)) {
+        audioBase64 = ttsResult.buffer.toString('base64');
+        audioMimeType = ttsResult.mimeType;
+      }
     } catch (ttsErr: any) {
       console.warn('TTS inline generation skipped or timed out:', ttsErr?.message);
     }
@@ -518,7 +558,7 @@ app.post('/api/rag/query', async (req, res) => {
       thinkingProcess,
       retrievedSources,
       audioBase64,
-      audioMimeType: audioBase64 ? 'audio/pcm;rate=24000' : undefined,
+      audioMimeType,
       latencyMs,
       modelUsed: selectedModel,
     });
@@ -563,8 +603,9 @@ wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) 
     }
 
     // Top knowledge and ALL user-uploaded documents to ground Live API
-    const customDocs = ragEngine.getCustomDocuments(user.id);
-    const userMemories = getUserMemories(user.id);
+    const adminAccess = isAdminUser(user);
+    const customDocs = adminAccess ? ragEngine.getAllCustomDocuments() : ragEngine.getCustomDocuments(user.id);
+    const userMemories = adminAccess ? getAllStoredUserMemories() : getUserMemories(user.id);
     const standardDocs = ragEngine.getAllDocuments(user.id).filter((d) => !d.isCustom);
 
     let uploadedFilesGrounding = '';
@@ -588,6 +629,7 @@ wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) 
       : '';
 
     const systemInstruction = `You are a Bangladeshi Bangla voice AI agent speaking native, authentic Bengali with high cultural and local knowledge.
+  Begin every new conversation by saying in Bengali: "আসসালামু আলাইকুম। আপনাকে আন্তরিক স্বাগতম। আমি কীভাবে আপনাকে সাহায্য করতে পারি?" Then answer the user's request naturally.
 ${uploadedFilesGrounding}
 ${storedMemoryGrounding}
 Standard Knowledge Base Context:
@@ -618,9 +660,20 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
           if ((message as any).serverContent?.turnComplete && pendingInputTranscript.trim()) {
             const transcript = pendingInputTranscript.trim();
             pendingInputTranscript = '';
-            storeImportantVoiceData(ai!, user.id, transcript).catch((memoryError: any) => {
-              console.warn('Live voice memory was not stored:', memoryError?.message || memoryError);
-            });
+            if (isAdminUser(user)) {
+              ragEngine.addDocument({
+                title: `Admin live voice information - ${new Date().toISOString().slice(0, 10)}`,
+                category: 'custom',
+                content: transcript,
+                summary: transcript.slice(0, 160) + (transcript.length > 160 ? '...' : ''),
+                tags: ['admin_voice', 'shared_information'],
+                isCustom: true,
+              }, SHARED_OWNER_ID);
+            } else {
+              storeImportantVoiceData(ai!, user.id, transcript).catch((memoryError: any) => {
+                console.warn('Live voice memory was not stored:', memoryError?.message || memoryError);
+              });
+            }
           }
 
           // Model turn audio output
@@ -706,9 +759,24 @@ async function setupViteMiddleware() {
     });
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Bangladeshi Bangla Voice AI Server running on http://0.0.0.0:${PORT}`);
-  });
+  const startServerOnPort = (port: number) => {
+    server.once('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE') {
+        const nextPort = port + 1;
+        console.warn(`Port ${port} is already in use. Retrying on ${nextPort}...`);
+        startServerOnPort(nextPort);
+        return;
+      }
+      console.error('Server startup error:', error);
+      process.exit(1);
+    });
+
+    server.listen(port, '0.0.0.0', () => {
+      console.log(`Bangladeshi Bangla Voice AI Server running on http://0.0.0.0:${port}`);
+    });
+  };
+
+  startServerOnPort(PORT);
 }
 
 setupViteMiddleware();

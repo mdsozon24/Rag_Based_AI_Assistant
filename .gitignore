@@ -1,11 +1,4 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
+.env
 data/users.json
-data/custom_documents.json
-data/user_data/
+node_modules
+dist/
