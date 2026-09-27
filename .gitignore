@@ -1,4 +1,6 @@
 .env
 data/users.json
+data/voice_settings.json
 node_modules
 dist/
+voice-samples/

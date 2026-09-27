@@ -9,6 +9,8 @@ interface EmbeddedDoc extends KnowledgeDocument {
   vector?: number[];
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 const DATA_DIR = path.join(process.cwd(), 'data');
 const STORED_DOCS_PATH = path.join(DATA_DIR, 'custom_documents.json');
 const USER_DATA_DIR = path.join(DATA_DIR, 'user_data');
@@ -129,7 +131,8 @@ export class RagEngine {
       (doc) => doc.isCustom && (doc.ownerUserId === SHARED_OWNER_ID || doc.ownerUserId === ownerUserId) && !doc.vector
     );
     for (const document of userDocuments) {
-      await this.embedSingleDoc(document);
+      // Single attempt on the request path so a 429 never stalls the user's query
+      if (await this.embedSingleDoc(document, 1) === 'rate-limited') break;
     }
   }
 
@@ -227,35 +230,61 @@ export class RagEngine {
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
-  private async embedSingleDoc(doc: EmbeddedDoc): Promise<void> {
-    if (!this.ai) return;
-    try {
-      const textToEmbed = `${doc.title}\n${doc.summary}\n${doc.content}\n${doc.tags.join(' ')}`;
-      const result = await this.ai.models.embedContent({
-        model: 'gemini-embedding-2-preview',
-        contents: [textToEmbed]
-      });
-      // Extract embedding values
-      const values = result.embeddings?.[0]?.values;
-      if (values && values.length > 0) {
-        doc.vector = values;
-        if (doc.ownerUserId) {
-          this.savePersistedDocuments();
+  private isRateLimitError(err: any): boolean {
+    const text = `${err?.status ?? ''} ${err?.message ?? err ?? ''}`;
+    return /429|RESOURCE_EXHAUSTED/i.test(text);
+  }
+
+  /** Returns 'ok', 'rate-limited' (quota still exhausted after retries) or 'failed'. */
+  private async embedSingleDoc(doc: EmbeddedDoc, maxAttempts = 4): Promise<'ok' | 'rate-limited' | 'failed'> {
+    if (!this.ai) return 'failed';
+    const textToEmbed = `${doc.title}\n${doc.summary}\n${doc.content}\n${doc.tags.join(' ')}`;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const result = await this.ai.models.embedContent({
+          model: 'gemini-embedding-2-preview',
+          contents: [textToEmbed]
+        });
+        // Extract embedding values
+        const values = result.embeddings?.[0]?.values;
+        if (values && values.length > 0) {
+          doc.vector = values;
+          if (doc.ownerUserId) {
+            this.savePersistedDocuments();
+          }
+          return 'ok';
         }
+        return 'failed';
+      } catch (err: any) {
+        if (this.isRateLimitError(err) && attempt < maxAttempts) {
+          // Exponential backoff: 2s, 4s, 8s
+          await sleep(2000 * 2 ** (attempt - 1));
+          continue;
+        }
+        if (this.isRateLimitError(err)) return 'rate-limited';
+        console.warn('Doc embedding skipped/failed:', err?.message || err);
+        return 'failed';
       }
-    } catch (err: any) {
-      console.warn('Doc embedding skipped/failed:', err?.message || err);
     }
+    return 'failed';
   }
 
   public async initializeEmbeddings(): Promise<void> {
     if (!this.ai || this.isEmbeddingReady) return;
     try {
-      // Embed documents in batches
-      for (const doc of this.documents) {
-        if (!doc.vector) {
-          await this.embedSingleDoc(doc);
+      const pending = this.documents.filter(doc => !doc.vector);
+      for (const doc of pending) {
+        const outcome = await this.embedSingleDoc(doc);
+        if (outcome === 'rate-limited') {
+          const remaining = this.documents.filter(d => !d.vector).length;
+          console.warn(
+            `[RAG Engine] Gemini embedding quota exhausted (429). Skipping ${remaining} remaining document(s); ` +
+            'keyword search stays available and embeddings will be retried when documents are used.'
+          );
+          return;
         }
+        // Space out requests to stay under the per-minute rate limit
+        await sleep(500);
       }
       this.isEmbeddingReady = true;
     } catch (err) {

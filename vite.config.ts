@@ -16,7 +16,8 @@ export default defineConfig(() => {
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // data/ is written at runtime (voice memories, uploads); watching it reloads the page and drops the live session.
+      watch: process.env.DISABLE_HMR === 'true' ? null : { ignored: ['**/data/**'] },
     },
   };
 });

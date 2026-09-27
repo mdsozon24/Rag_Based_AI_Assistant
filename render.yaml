@@ -12,6 +12,10 @@ services:
         value: production
       - key: GEMINI_API_KEY
         sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
       - key: ADMIN_EMAILS
         sync: false
       - key: SMTP_HOST

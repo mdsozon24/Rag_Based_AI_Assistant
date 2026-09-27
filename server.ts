@@ -3,12 +3,20 @@ import http from 'http';
 import path from 'path';
 import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
-import { GoogleGenAI, Modality, ThinkingLevel, LiveServerMessage } from '@google/genai';
+import { ActivityHandling, EndSensitivity, GoogleGenAI, StartSensitivity, Modality, ThinkingLevel, LiveServerMessage } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import { RagEngine, SHARED_OWNER_ID } from './server/rag.ts';
 import { extractTextFromPdfBuffer, generateContentWithFallback } from './server/fileProcessor.ts';
 import { clearSessionCookie, createSession, getUserFromRequest, isAdminUser, login, logout, publicUser, register, requestPasswordReset, resetPassword, sessionCookie } from './server/auth.ts';
 import { getAllStoredUserMemories, getUserMemories, storeImportantVoiceData } from './server/userData.ts';
+import {
+  ElevenLabsLiveRelay,
+  generateElevenLabsSpeech,
+  getActiveVoiceId,
+  isElevenLabsEnabled,
+  listVoiceOptions,
+  selectVoice,
+} from './server/elevenlabs.ts';
 
 dotenv.config();
 
@@ -100,7 +108,18 @@ async function generateGeminiSpeech(client: GoogleGenAI, text: string): Promise<
     mimeType: 'audio/wav',
   };
 }
-
+/** Prefer ElevenLabs for a more natural Bangla voice; fall back to Gemini TTS. */
+async function generateSpeech(client: GoogleGenAI | null, text: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  if (isElevenLabsEnabled()) {
+    try {
+      return await generateElevenLabsSpeech(sanitizeSpeechText(text));
+    } catch (error: any) {
+      console.warn('ElevenLabs TTS failed, falling back to Gemini TTS:', error?.message || error);
+    }
+  }
+  if (!client) throw new Error('No TTS provider is configured.');
+  return generateGeminiSpeech(client, text);
+}
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -134,6 +153,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    ttsProvider: isElevenLabsEnabled() ? 'elevenlabs' : 'gemini',
   });
 });
 
@@ -426,7 +446,7 @@ app.post('/api/transcribe', async (req, res) => {
   }
 });
 
-// POST Convert Text to Speech using Gemini
+// POST Convert Text to Speech (ElevenLabs, falling back to Gemini)
 app.post('/api/tts', async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
@@ -436,11 +456,11 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text is required for TTS' });
     }
 
-    if (!ai) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in server environment.' });
+    if (!ai && !isElevenLabsEnabled()) {
+      return res.status(500).json({ error: 'No TTS provider is configured in server environment.' });
     }
 
-    const audio = await generateGeminiSpeech(ai, text);
+    const audio = await generateSpeech(ai, text);
 
     res.json({
       audioBase64: audio.buffer.toString('base64'),
@@ -449,6 +469,59 @@ app.post('/api/tts', async (req, res) => {
   } catch (error: any) {
     console.error('TTS error:', error);
     res.status(500).json({ error: error?.message || 'Failed to generate speech' });
+  }
+});
+
+// GET Human Bangla voices an admin can choose, and the voice used for every answer (admin)
+app.get('/api/admin/voice', async (req, res) => {
+  const user = requireAdmin(req, res);
+  if (!user) return;
+  if (!isElevenLabsEnabled()) {
+    return res.json({ enabled: false, voiceId: null, voices: [] });
+  }
+  try {
+    const voices = await listVoiceOptions(req.query.refresh === '1');
+    res.json({ enabled: true, voiceId: getActiveVoiceId(), voices });
+  } catch (error: any) {
+    console.error('Voice list error:', error);
+    res.status(502).json({ error: 'কণ্ঠের তালিকা লোড করা যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।' });
+  }
+});
+
+// PUT Select the voice for all users (admin)
+app.put('/api/admin/voice', async (req, res) => {
+  const user = requireAdmin(req, res);
+  if (!user) return;
+  try {
+    const { voiceId } = req.body;
+    if (typeof voiceId !== 'string' || !voiceId) {
+      return res.status(400).json({ error: 'একটি কণ্ঠ নির্বাচন করুন।' });
+    }
+    await selectVoice(voiceId, user.email);
+    res.json({ voiceId });
+  } catch (error: any) {
+    if (error?.message === 'UNKNOWN_VOICE') {
+      return res.status(400).json({ error: 'এই কণ্ঠটি পাওয়া যায়নি। তালিকা হালনাগাদ করে আবার চেষ্টা করুন।' });
+    }
+    console.error('Voice update error:', error);
+    res.status(500).json({ error: 'কণ্ঠ সংরক্ষণ করা যায়নি। আবার চেষ্টা করুন।' });
+  }
+});
+
+// POST Speak a short Bangla sample with a voice before selecting it (admin)
+app.post('/api/admin/voice/preview', async (req, res) => {
+  const user = requireAdmin(req, res);
+  if (!user) return;
+  try {
+    const { voiceId } = req.body;
+    if (typeof voiceId !== 'string' || !voiceId) {
+      return res.status(400).json({ error: 'একটি কণ্ঠ নির্বাচন করুন।' });
+    }
+    const audio = await generateElevenLabsSpeech(BENGALI_GREETING, voiceId);
+    res.json({ audioBase64: audio.buffer.toString('base64'), mimeType: audio.mimeType });
+  } catch (error: any) {
+    console.error('Voice preview error:', error);
+    res.status(502).json({ error: 'এই কণ্ঠটি এখন শোনানো যাচ্ছে না। আবার চেষ্টা করুন।' });
   }
 });
 
@@ -536,11 +609,11 @@ app.post('/api/rag/query', async (req, res) => {
 
     responseText = enforceBanglaGreeting(responseText);
 
-    // Generate the complete Bengali answer with Gemini TTS. No application-level text cap.
+    // Generate the complete Bengali answer with ElevenLabs (or Gemini) TTS. No application-level text cap.
     let audioBase64: string | undefined = undefined;
     let audioMimeType: string | undefined = undefined;
     try {
-      const ttsPromise = generateGeminiSpeech(ai, responseText);
+      const ttsPromise = generateSpeech(ai, responseText);
       const ttsTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 30000));
       const ttsResult = (await Promise.race([ttsPromise, ttsTimeout])) as any;
       if (ttsResult?.buffer && Buffer.isBuffer(ttsResult.buffer)) {
@@ -589,6 +662,16 @@ wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) 
   console.log('Client connected to Live audio WebSocket');
   let liveSession: any = null;
   let pendingInputTranscript = '';
+  // Gemini is still producing the current answer (between its first output and generationComplete)
+  let modelGenerating = false;
+  // The user talked over the answer: skip the rest of it until Gemini ends that turn
+  let dropModelOutput = false;
+  // With ElevenLabs, Gemini's reply text is re-voiced and Gemini's own audio is discarded
+  const speechRelay = isElevenLabsEnabled()
+    ? new ElevenLabsLiveRelay((audio) => {
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ audio }));
+      })
+    : null;
   const user = getUserFromRequest(request);
   if (!user) {
     clientWs.close(1008, 'Authentication required');
@@ -629,12 +712,13 @@ wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) 
       : '';
 
     const systemInstruction = `You are a Bangladeshi Bangla voice AI agent speaking native, authentic Bengali with high cultural and local knowledge.
-  Begin every new conversation by saying in Bengali: "আসসালামু আলাইকুম। আপনাকে আন্তরিক স্বাগতম। আমি কীভাবে আপনাকে সাহায্য করতে পারি?" Then answer the user's request naturally.
+  When the session starts you will be asked to greet the user; say exactly: "${BENGALI_GREETING}" Do not repeat the greeting later in the conversation; answer the user's requests naturally.
 ${uploadedFilesGrounding}
 ${storedMemoryGrounding}
 Standard Knowledge Base Context:
 ${standardKnowledgeSnippets}
-Speak concisely, warmly, and naturally in Bengali. You prioritize information from user uploaded files when asked.`;
+Speak warmly and naturally in Bengali. You prioritize information from user uploaded files when asked.
+Talk like a real Bangladeshi person in a friendly conversation, not like a machine reading text. Give complete, well-explained answers: usually several sentences that fully cover what the user asked, with helpful details and examples. Only keep it brief for greetings, small talk, or when the user asks for a short answer. Use natural spoken sentences with proper punctuation (। , ?), and never use lists, symbols, or markdown.`;
 
     // Connect to Gemini Live API: gemini-3.1-flash-live-preview
     liveSession = await ai.live.connect({
@@ -650,6 +734,20 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
         },
         systemInstruction,
         inputAudioTranscription: {},
+        ...(speechRelay ? { outputAudioTranscription: {} } : {}),
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            // Only clear, sustained speech starts a user turn, not background voices or noise
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+            // Let the user finish: a pause mid-sentence should not make the model answer early.
+            // At 800ms a 0.7s pause already let a false start reach the speaker; 1200ms did not.
+            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+            silenceDurationMs: 1200,
+            prefixPaddingMs: 200,
+          },
+          // The user can talk over the model; it stops and listens
+          activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        },
       },
       callbacks: {
         onmessage: (message: LiveServerMessage) => {
@@ -676,15 +774,37 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
             }
           }
 
-          // Model turn audio output
-          const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-          if (audio && clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({ audio }));
+          const serverContent = message.serverContent;
+          const answerEnded = Boolean(serverContent?.generationComplete || serverContent?.turnComplete || serverContent?.interrupted);
+          if (dropModelOutput) {
+            // Rest of the answer the user interrupted; wait for Gemini to end that turn
+            if (answerEnded) dropModelOutput = false;
+          } else if (speechRelay) {
+            if (serverContent?.outputTranscription?.text) modelGenerating = true;
+            // Speak the model's reply with ElevenLabs
+            const outputTranscript = message.serverContent?.outputTranscription?.text;
+            if (outputTranscript) speechRelay.pushText(outputTranscript);
+            // Gemini delivers the whole answer by generationComplete but holds turnComplete until its
+            // own (discarded) audio would finish playing, often 20s later; speak the rest right away.
+            if (message.serverContent?.generationComplete || message.serverContent?.turnComplete) speechRelay.flush();
+          } else {
+            // Model turn audio output
+            for (const part of message.serverContent?.modelTurn?.parts || []) {
+              const audio = part.inlineData?.data;
+              if (audio) modelGenerating = true;
+              if (audio && clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({ audio }));
+              }
+            }
           }
+          if (answerEnded) modelGenerating = false;
 
           // Real-time interruption event
-          if (message.serverContent?.interrupted && clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({ interrupted: true }));
+          if (message.serverContent?.interrupted) {
+            speechRelay?.interrupt();
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ interrupted: true }));
+            }
           }
 
           // If transcription is returned by model
@@ -697,8 +817,25 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
             }
           }
         },
+        onerror: (e: any) => {
+          console.warn('Gemini Live session error:', e?.message || e);
+        },
+        onclose: (e: any) => {
+          console.log('Gemini Live session closed:', e?.code, e?.reason || '');
+          liveSession = null;
+          // Let the client know so it can reconnect instead of streaming into a dead session
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.close(1011, 'Live session ended');
+          }
+        },
       },
     });
+
+    // Speak the welcome greeting as soon as the user starts a voice session
+    const { searchParams } = new URL(request.url || '', `http://${request.headers.host}`);
+    if (searchParams.get('greet') !== '0') {
+      liveSession.sendRealtimeInput({ text: `Greet the user now by saying exactly: "${BENGALI_GREETING}"` });
+    }
 
     clientWs.on('message', (rawData) => {
       try {
@@ -711,6 +848,16 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
               mimeType: 'audio/pcm;rate=16000',
             },
           });
+        } else if (payload.interrupt) {
+          // The user started talking over the answer (detected in the browser): stop speaking now.
+          // If Gemini is still writing that answer, skip the rest until it notices the user too.
+          speechRelay?.interrupt();
+          if (modelGenerating) dropModelOutput = true;
+          modelGenerating = false;
+          if (clientWs.readyState === WebSocket.OPEN) {
+            // Every audio message sent after this acknowledgement belongs to the next answer
+            clientWs.send(JSON.stringify({ interruptAck: true }));
+          }
         } else if (payload.text && liveSession) {
           liveSession.sendRealtimeInput({
             text: payload.text,
@@ -723,6 +870,7 @@ Speak concisely, warmly, and naturally in Bengali. You prioritize information fr
 
     clientWs.on('close', () => {
       console.log('Client closed Live audio WebSocket');
+      speechRelay?.close();
       if (liveSession) {
         try {
           liveSession.close();
@@ -772,7 +920,7 @@ async function setupViteMiddleware() {
     });
 
     server.listen(port, '0.0.0.0', () => {
-      console.log(`Bangladeshi Bangla Voice AI Server running on http://0.0.0.0:${port}`);
+      console.log(`Bangladeshi Bangla Voice AI Server running on http://localhost:${port}`);
     });
   };
 

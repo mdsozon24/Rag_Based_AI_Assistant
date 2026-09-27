@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-interface AuthUser { id: string; email: string; createdAt: string; }
+interface AuthUser { id: string; email: string; createdAt: string; isAdmin?: boolean; }
 
 interface AuthScreenProps {
   onAuthenticated: (user: AuthUser) => void;

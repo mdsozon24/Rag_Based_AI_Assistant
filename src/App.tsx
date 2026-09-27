@@ -18,20 +18,22 @@ import {
   ChevronUp,
   CheckCircle2,
 } from 'lucide-react';
-import { GaplessPcmPlayer, float32ToInt16PCM, arrayBufferToBase64 } from './utils/audioUtils';
+import { BargeInDetector, GaplessPcmPlayer, MainSpeakerGate, float32ToInt16PCM, arrayBufferToBase64 } from './utils/audioUtils';
 import { KnowledgeDocument, ModelMode } from './types';
 import { AuthScreen } from './components/AuthScreen';
+import { VoiceSettingsPanel } from './components/VoiceSettingsPanel';
 
 type VoiceState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error';
 
 export default function App() {
-  const [user, setUser] = useState<{ id: string; email: string; createdAt: string } | null>(null);
+  const [user, setUser] = useState<{ id: string; email: string; createdAt: string; isAdmin?: boolean } | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [selectedMode, setSelectedMode] = useState<ModelMode>('standard');
   const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [volumeLevel, setVolumeLevel] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>('কথা বলতে বোতামে চাপ দিন');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isVoicePanelOpen, setIsVoicePanelOpen] = useState(false);
 
   const readJsonResponse = async <T,>(response: Response, fallbackMessage: string): Promise<T> => {
     const rawText = await response.text();
@@ -77,6 +79,11 @@ export default function App() {
   const micAudioCtxRef = useRef<AudioContext | null>(null);
   const micMediaStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  // Talking over the AI stops it; audio for the interrupted reply is ignored until the server confirms
+  const bargeInRef = useRef(new BargeInDetector());
+  const awaitingInterruptAckRef = useRef(false);
+  // Only the person at the mic is sent to the model; side voices and noise become silence
+  const speakerGateRef = useRef(new MainSpeakerGate());
 
   // Fallback recorder for voice queries if WS is closed
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -98,7 +105,7 @@ export default function App() {
   useEffect(() => {
     fetch('/api/auth/me')
       .then(async (res) => {
-        const data = await readJsonResponse<{ user?: { id: string; email: string; createdAt: string } | null }>(res, 'Authentication state could not be loaded.');
+        const data = await readJsonResponse<{ user?: { id: string; email: string; createdAt: string; isAdmin?: boolean } | null }>(res, 'Authentication state could not be loaded.');
         setUser(data.user || null);
         if (data.user) fetchStoredDocuments();
       })
@@ -123,6 +130,7 @@ export default function App() {
     await fetch('/api/auth/logout', { method: 'POST' });
     setUser(null);
     setStoredDocs([]);
+    setIsVoicePanelOpen(false);
   };
 
 
@@ -186,7 +194,7 @@ export default function App() {
     }
   };
 
-  const startVoiceSession = async () => {
+  const startVoiceSession = async (isReconnect = false) => {
     shouldReconnectLiveRef.current = true;
     setErrorMessage(null);
     setVoiceState('connecting');
@@ -200,9 +208,12 @@ export default function App() {
       await pcmPlayer.resume();
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws/live`;
+      const wsUrl = `${protocol}//${window.location.host}/ws/live${isReconnect ? '?greet=0' : ''}`;
       const ws = new WebSocket(wsUrl);
       liveWsRef.current = ws;
+      awaitingInterruptAckRef.current = false;
+      bargeInRef.current.reset();
+      speakerGateRef.current = new MainSpeakerGate();
 
       ws.onopen = async () => {
         liveHasConnectedRef.current = true;
@@ -210,10 +221,15 @@ export default function App() {
           const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               sampleRate: 16000,
-              channelCount: 1,
+              channelCount: 1, // mono: one voice, one channel
               echoCancellation: true,
               noiseSuppression: true,
-            },
+              // Automatic gain boosts the mic whenever the user is quiet, making voices across the room
+              // as loud as the user's; without it the person at the mic stays clearly louder.
+              autoGainControl: false,
+              // Isolates the main voice where the browser supports it; ignored elsewhere
+              voiceIsolation: true,
+            } as MediaTrackConstraints,
           });
           micMediaStreamRef.current = stream;
 
@@ -222,7 +238,12 @@ export default function App() {
           micAudioCtxRef.current = audioCtx;
 
           const source = audioCtx.createMediaStreamSource(stream);
-          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          // Remove low rumble (fans, traffic, desk bumps) below the speaking voice
+          const rumbleFilter = audioCtx.createBiquadFilter();
+          rumbleFilter.type = 'highpass';
+          rumbleFilter.frequency.value = 100;
+          // 1024 samples = 64ms frames, so the model hears the user (and barge-in reacts) quickly
+          const processor = audioCtx.createScriptProcessor(1024, 1, 1);
           scriptProcessorRef.current = processor;
 
           processor.onaudioprocess = (e) => {
@@ -239,13 +260,39 @@ export default function App() {
             const normVolume = Math.min(100, Math.round(rms * 450));
             setVolumeLevel(normVolume);
 
-            // Send 16kHz PCM audio
-            const pcmBuffer = float32ToInt16PCM(inputData);
-            const base64Audio = arrayBufferToBase64(pcmBuffer);
-            ws.send(JSON.stringify({ audio: base64Audio }));
+            const sendAudio = (samples: Float32Array) => {
+              ws.send(JSON.stringify({ audio: arrayBufferToBase64(float32ToInt16PCM(samples)) }));
+            };
+
+            // Send 16kHz PCM audio. While the AI is speaking, send silence so its own voice picked up
+            // by the mic is not mistaken for the user, but watch for the user talking over it.
+            const player = pcmPlayerRef.current;
+            const aiSpeaking = (player?.isPlaying ?? false) && !awaitingInterruptAckRef.current;
+            if (!aiSpeaking) {
+              bargeInRef.current.reset();
+              const mainSpeaker = speakerGateRef.current.process(inputData, rms);
+              if (mainSpeaker.length > 0) mainSpeaker.forEach(sendAudio);
+              else sendAudio(new Float32Array(inputData.length));
+              return;
+            }
+            // Side voices must not interrupt either: require the main speaker's level
+            const userSpeech = bargeInRef.current.process(inputData, rms, speakerGateRef.current.threshold());
+            if (!userSpeech) {
+              sendAudio(new Float32Array(inputData.length));
+              return;
+            }
+            // The user started talking: stop the AI at once and let the model hear them from the start
+            player?.stop();
+            awaitingInterruptAckRef.current = true;
+            ws.send(JSON.stringify({ interrupt: true }));
+            userSpeech.forEach(sendAudio);
+            speakerGateRef.current.forceOpen();
+            setVoiceState('listening');
+            setStatusMessage('শুনছি... বলুন');
           };
 
-          source.connect(processor);
+          source.connect(rumbleFilter);
+          rumbleFilter.connect(processor);
           processor.connect(audioCtx.destination);
 
           setVoiceState('listening');
@@ -268,7 +315,12 @@ export default function App() {
             return;
           }
 
-          if (data.audio) {
+          if (data.interruptAck) {
+            awaitingInterruptAckRef.current = false;
+          }
+
+          // Skip what is left of a reply the user talked over
+          if (data.audio && !awaitingInterruptAckRef.current) {
             setVoiceState('speaking');
             setStatusMessage('এআই উত্তর দিচ্ছে...');
             pcmPlayerRef.current?.queuePcmBase64(data.audio);
@@ -299,7 +351,7 @@ export default function App() {
             setStatusMessage('সংযোগ পুনরায় স্থাপন হচ্ছে...');
             liveReconnectTimerRef.current = setTimeout(() => {
               liveReconnectTimerRef.current = null;
-              startVoiceSession();
+              startVoiceSession(true);
             }, 1000);
           } else {
             shouldReconnectLiveRef.current = false;
@@ -617,6 +669,12 @@ export default function App() {
       </header>
       <div className="absolute right-6 top-5 z-20 flex items-center gap-3 text-xs text-slate-400">
         <span className="hidden sm:inline">{user.email}</span>
+        {user.isAdmin && (
+          <button type="button" onClick={() => setIsVoicePanelOpen(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-emerald-500/50 hover:text-emerald-300" title="এআই কণ্ঠ নির্বাচন">
+            <Volume2 className="h-3.5 w-3.5" />
+            <span>Voice</span>
+          </button>
+        )}
         <button type="button" onClick={handleLogout} className="rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-rose-500/50 hover:text-rose-300">Sign out</button>
       </div>
 
@@ -926,6 +984,8 @@ export default function App() {
           <span>PDF বা TXT ফাইল ড্রপ করে যুক্ত করুন অথবা বোতামে চাপ দিয়ে কথা বলুন</span>
         )}
       </footer>
+
+      {isVoicePanelOpen && <VoiceSettingsPanel onClose={() => setIsVoicePanelOpen(false)} />}
     </main>
   );
 }
