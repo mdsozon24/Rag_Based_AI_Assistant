@@ -26,11 +26,30 @@ interface ResetToken {
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const USERS_PATH = path.join(DATA_DIR, 'users.json');
+const SESSIONS_PATH = path.join(DATA_DIR, 'sessions.json');
 const SESSION_COOKIE = 'bn_session';
-const sessions = new Map<string, { userId: string; expiresAt: number }>();
 const resetTokens = new Map<string, ResetToken>();
 
 function ensureDataDir() { fs.mkdirSync(DATA_DIR, { recursive: true }); }
+
+// Sessions are kept on disk so restarting the server does not sign everyone out.
+// Only a hash of each token is stored.
+type Session = { userId: string; expiresAt: number };
+const sessions = loadSessions();
+
+function hashToken(token: string) { return crypto.createHash('sha256').update(token).digest('hex'); }
+
+function loadSessions(): Map<string, Session> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8')) as Record<string, Session>;
+    return new Map(Object.entries(parsed).filter(([, session]) => session?.expiresAt > Date.now()));
+  } catch { return new Map(); }
+}
+
+function saveSessions() {
+  ensureDataDir();
+  fs.writeFileSync(SESSIONS_PATH, JSON.stringify(Object.fromEntries(sessions)), 'utf8');
+}
 
 function loadUsers(): AuthUser[] {
   ensureDataDir();
@@ -71,16 +90,32 @@ function parseCookies(header = '') {
   }).filter(([key]) => key));
 }
 
+/**
+ * Makes sure the first ADMIN_EMAILS address has an account whose password is ADMIN_PASSWORD.
+ * users.json is not deployed, so without this anyone could register the admin email on a fresh server.
+ */
+export function ensureAdminAccount() {
+  const email = normalizeEmail((process.env.ADMIN_EMAILS || '').split(',')[0] || '');
+  const password = process.env.ADMIN_PASSWORD || '';
+  if (!email || !validPassword(password)) return;
+  const users = loadUsers();
+  const existing = users.find((user) => user.email === email);
+  if (existing && verifyPassword(password, existing.passwordHash)) return;
+  if (existing) existing.passwordHash = hashPassword(password);
+  else users.push({ id: crypto.randomUUID(), email, passwordHash: hashPassword(password), createdAt: new Date().toISOString() });
+  saveUsers(users);
+}
+
 export function publicUser(user: AuthUser) {
   return { id: user.id, email: user.email, createdAt: user.createdAt, isAdmin: isAdminUser(user) };
 }
 
 export function register(emailInput: unknown, password: unknown) {
   const email = typeof emailInput === 'string' ? normalizeEmail(emailInput) : '';
-  if (!/^\S+@\S+\.\S+$/.test(email)) throw new Error('A valid email address is required.');
+  if (!/^\S+@\S+\.\S+$/.test(email)) throw new Error('Please enter a valid email address.');
   if (!validPassword(password)) throw new Error('Password must be at least 8 characters.');
   const users = loadUsers();
-  if (users.some((user) => user.email === email)) throw new Error('An account with this email already exists.');
+  if (users.some((user) => user.email === email)) throw new Error('An account with this email already exists. Please log in.');
   const user: AuthUser = { id: crypto.randomUUID(), email, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
   users.push(user);
   saveUsers(users);
@@ -94,7 +129,7 @@ export function login(emailInput: unknown, password: unknown) {
   const email = typeof emailInput === 'string' ? normalizeEmail(emailInput) : '';
   const user = loadUsers().find((candidate) => candidate.email === email);
   if (!user || typeof password !== 'string' || !verifyPassword(password, user.passwordHash)) {
-    throw new Error('Email or password is incorrect.');
+    throw new Error('Incorrect email or password.');
   }
   if (!isAdminUser(user)) {
     ensureUserDataFile(user.id);
@@ -104,15 +139,19 @@ export function login(emailInput: unknown, password: unknown) {
 
 export function createSession(userId: string) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { userId, expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  sessions.set(hashToken(token), { userId, expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 7 });
+  saveSessions();
   return token;
 }
 
 export function getUserFromRequest(request: { headers: { cookie?: string } }) {
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
-  const session = token ? sessions.get(token) : undefined;
+  const session = token ? sessions.get(hashToken(token)) : undefined;
   if (!session || session.expiresAt <= Date.now()) {
-    if (token) sessions.delete(token);
+    if (session && token) {
+      sessions.delete(hashToken(token));
+      saveSessions();
+    }
     return undefined;
   }
   return loadUsers().find((user) => user.id === session.userId);
@@ -127,17 +166,17 @@ export function clearSessionCookie() { return `${SESSION_COOKIE}=; HttpOnly; Pat
 
 export function logout(request: { headers: { cookie?: string } }) {
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
-  if (token) sessions.delete(token);
+  if (token && sessions.delete(hashToken(token))) saveSessions();
 }
 
 async function sendResetEmail(email: string, token: string) {
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, APP_URL } = process.env;
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-    throw new Error('Password reset email is not configured. Set SMTP_HOST, SMTP_USER, and SMTP_PASS.');
+    throw new Error('Password reset email is not configured. Set SMTP_HOST, SMTP_USER and SMTP_PASS in the server .env file.');
   }
   const transporter = nodemailer.createTransport({ host: SMTP_HOST, port: Number(SMTP_PORT || 587), secure: SMTP_PORT === '465', auth: { user: SMTP_USER, pass: SMTP_PASS } });
   const resetUrl = `${APP_URL || `http://localhost:${process.env.PORT || 3100}`}?resetToken=${encodeURIComponent(token)}`;
-  await transporter.sendMail({ from: process.env.SMTP_FROM || SMTP_USER, to: email, subject: 'Reset your BN AI Assistant password', text: `Use this link to reset your password. It expires in 30 minutes:\n\n${resetUrl}` });
+  await transporter.sendMail({ from: process.env.SMTP_FROM || SMTP_USER, to: email, subject: 'Bangla AI Assistant: password reset', text: `Open the link below to reset your password. It is valid for 30 minutes:\n\n${resetUrl}` });
 }
 
 export async function requestPasswordReset(emailInput: unknown) {
@@ -151,7 +190,7 @@ export async function requestPasswordReset(emailInput: unknown) {
 
 export function resetPassword(token: unknown, password: unknown) {
   const entry = typeof token === 'string' ? resetTokens.get(token) : undefined;
-  if (!entry || entry.expiresAt <= Date.now()) throw new Error('This reset link is invalid or expired.');
+  if (!entry || entry.expiresAt <= Date.now()) throw new Error('This reset link is invalid or has expired.');
   if (!validPassword(password)) throw new Error('Password must be at least 8 characters.');
   const users = loadUsers();
   const user = users.find((candidate) => candidate.id === entry.userId);

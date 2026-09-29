@@ -1,5 +1,6 @@
 .env
 data/users.json
+data/sessions.json
 data/voice_settings.json
 node_modules
 dist/

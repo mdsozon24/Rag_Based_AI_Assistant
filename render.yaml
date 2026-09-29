@@ -18,6 +18,8 @@ services:
         sync: false
       - key: ADMIN_EMAILS
         sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import { isFatalAiError } from './errors';
 
 /**
  * Extracts raw readable text from a PDF Buffer without external dependencies.
@@ -81,6 +82,8 @@ export async function generateContentWithFallback(
     } catch (err: any) {
       lastError = err;
       const errMsg = err?.message || String(err);
+      // Billing and API key errors fail on every model, so stop instead of trying the others
+      if (isFatalAiError(err)) throw err;
       console.warn(`Model ${model} returned error, trying next fallback:`, errMsg.slice(0, 120));
       // If 503 or 429, retry with next model
       continue;

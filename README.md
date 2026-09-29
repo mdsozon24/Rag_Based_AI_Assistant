@@ -8,12 +8,12 @@ This contains everything you need to run your app locally.
 
 ## Run Locally
 
-**Prerequisites:**  Node.js
+**Prerequisites:**  Node.js 20 or newer (Python is not needed; the `.venv` folder is unused)
 
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Copy [.env.example](.env.example) to `.env` and set `GEMINI_API_KEY` to your Gemini API key. Keep `APP_URL=http://localhost:3100` for local runs.
 3. Set `ADMIN_EMAILS` to a comma-separated list of administrator email addresses:
 
 ```text
@@ -22,9 +22,14 @@ ADMIN_EMAILS=admin@example.com
 
 Administrator uploads and important voice statements are stored as shared knowledge in `data/custom_documents.json` and are available to every signed-in user. Regular user uploads and personal voice memories remain private.
 4. Run the app:
-   `npm run dev`
+   `npm run dev` (works from this folder or from the parent `octopi` folder)
 
-The development server runs at `http://localhost:3100` by default. Set `PORT` in `.env` to use another port.
+The development server runs at `http://localhost:3100` by default. Set `PORT` in `.env` to use another port. If the port is busy (for example the app is already running in another terminal), the server moves to the next free port and prints the address it is using.
+
+### Troubleshooting
+
+- **The app says "জেমিনি এআই অ্যাকাউন্টের ক্রেডিট শেষ হয়ে গেছে"** (the voice button connects and then stops): the Google AI Studio project behind `GEMINI_API_KEY` has no prepaid credit left, so every Gemini request returns HTTP 402. Add credit at https://ai.studio/projects, or put a key from a project with credit in `.env`, then restart the server. ElevenLabs cannot replace Gemini here: Gemini understands the question and writes the answer; ElevenLabs only speaks it.
+- **Microphone does not work**: open the app at `http://localhost:3100`, not at your computer's IP address. Browsers only allow the microphone on `localhost` or HTTPS.
 
 ## ElevenLabs voice (optional)
 

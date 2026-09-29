@@ -1,6 +1,16 @@
 @import "tailwindcss";
 
+/* In-between shades used by App.tsx; Tailwind has no slate-750/850, so without these the classes did nothing */
+@theme {
+  --color-slate-750: oklch(32.6% 0.043 258.7);
+  --color-slate-850: oklch(24.4% 0.042 262.9);
+}
+
 @layer base {
+  /* Dark scrollbars and form controls to match the dark design */
+  html {
+    color-scheme: dark;
+  }
   body {
     font-family: 'Hind Siliguri', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
   }

@@ -7,8 +7,9 @@ import { ActivityHandling, EndSensitivity, GoogleGenAI, StartSensitivity, Modali
 import { createServer as createViteServer } from 'vite';
 import { RagEngine, SHARED_OWNER_ID } from './server/rag.ts';
 import { extractTextFromPdfBuffer, generateContentWithFallback } from './server/fileProcessor.ts';
-import { clearSessionCookie, createSession, getUserFromRequest, isAdminUser, login, logout, publicUser, register, requestPasswordReset, resetPassword, sessionCookie } from './server/auth.ts';
+import { clearSessionCookie, createSession, ensureAdminAccount, getUserFromRequest, isAdminUser, login, logout, publicUser, register, requestPasswordReset, resetPassword, sessionCookie } from './server/auth.ts';
 import { getAllStoredUserMemories, getUserMemories, storeImportantVoiceData } from './server/userData.ts';
+import { NO_API_KEY_MESSAGE, toFriendlyError } from './server/errors.ts';
 import {
   ElevenLabsLiveRelay,
   generateElevenLabsSpeech,
@@ -19,6 +20,7 @@ import {
 } from './server/elevenlabs.ts';
 
 dotenv.config();
+ensureAdminAccount();
 
 const PORT = Number(process.env.PORT || 3100);
 const app = express();
@@ -160,7 +162,7 @@ app.get('/api/health', (req, res) => {
 function requireUser(req: express.Request, res: express.Response) {
   const user = getUserFromRequest(req);
   if (!user) {
-    res.status(401).json({ error: 'Please log in to continue.' });
+    res.status(401).json({ error: 'Please log in first.' });
     return undefined;
   }
   return user;
@@ -170,7 +172,7 @@ function requireAdmin(req: express.Request, res: express.Response) {
   const user = requireUser(req, res);
   if (!user) return undefined;
   if (!isAdminUser(user)) {
-    res.status(403).json({ error: 'Administrator access is required.' });
+    res.status(403).json({ error: 'Admin permission is required for this action.' });
     return undefined;
   }
   return user;
@@ -187,7 +189,7 @@ app.post('/api/auth/register', (req, res) => {
     res.setHeader('Set-Cookie', sessionCookie(createSession(user.id)));
     res.status(201).json({ user: publicUser(user) });
   } catch (error: any) {
-    res.status(400).json({ error: error?.message || 'Registration failed.' });
+    res.status(400).json({ error: error?.message || 'Could not create the account.' });
   }
 });
 
@@ -197,7 +199,7 @@ app.post('/api/auth/login', (req, res) => {
     res.setHeader('Set-Cookie', sessionCookie(createSession(user.id)));
     res.json({ user: publicUser(user) });
   } catch (error: any) {
-    res.status(401).json({ error: error?.message || 'Login failed.' });
+    res.status(401).json({ error: error?.message || 'Could not log in.' });
   }
 });
 
@@ -210,18 +212,18 @@ app.post('/api/auth/logout', (req, res) => {
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     await requestPasswordReset(req.body.email);
-    res.json({ message: 'If an account exists for that email, a reset link has been sent.' });
+    res.json({ message: 'If an account exists for this email, a password reset link has been sent.' });
   } catch (error: any) {
-    res.status(503).json({ error: error?.message || 'Could not send reset email.' });
+    res.status(503).json({ error: error?.message || 'Could not send the reset email.' });
   }
 });
 
 app.post('/api/auth/reset-password', (req, res) => {
   try {
     resetPassword(req.body.token, req.body.password);
-    res.json({ message: 'Password updated. You can now log in.' });
+    res.json({ message: 'Password updated. You can log in now.' });
   } catch (error: any) {
-    res.status(400).json({ error: error?.message || 'Could not reset password.' });
+    res.status(400).json({ error: error?.message || 'Could not reset the password.' });
   }
 });
 
@@ -233,19 +235,37 @@ app.get('/api/rag/documents', (req, res) => {
     const docs = ragEngine.getAllDocuments(user.id).filter((doc) => !doc.isCustom);
     res.json({ documents: docs });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to fetch documents' });
+    console.error('Document list error:', error);
+    res.status(500).json({ error: 'Could not load the document list.' });
   }
 });
 
-// GET Stored Custom Documents
+// GET Stored Custom Documents (admin only; regular users cannot browse uploaded data)
 app.get('/api/rag/custom-documents', (req, res) => {
-  const user = requireUser(req, res);
+  const user = requireAdmin(req, res);
   if (!user) return;
   try {
     const customDocs = ragEngine.getCustomDocuments(user.id);
     res.json({ documents: customDocs, count: customDocs.length });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to fetch custom documents' });
+    console.error('Custom document list error:', error);
+    res.status(500).json({ error: 'Could not load the stored documents.' });
+  }
+});
+
+// DELETE a stored document (admins delete shared documents, users their own)
+app.delete('/api/rag/documents/:id', (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  try {
+    const deleted = ragEngine.deleteDocument(req.params.id, isAdminUser(user) ? SHARED_OWNER_ID : user.id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Document not found.' });
+    }
+    res.status(204).end();
+  } catch (error: any) {
+    console.error('Document delete error:', error);
+    res.status(500).json({ error: 'Could not delete the document.' });
   }
 });
 
@@ -256,7 +276,7 @@ app.post('/api/rag/documents', (req, res) => {
   try {
     const { title, category, content, summary, tags, sourceUrl } = req.body;
     if (!title || !content) {
-      return res.status(400).json({ error: 'Title and content are required' });
+      return res.status(400).json({ error: 'Title and content are required.' });
     }
     const newDoc = ragEngine.addDocument({
       title,
@@ -268,7 +288,8 @@ app.post('/api/rag/documents', (req, res) => {
     }, isAdminUser(user) ? SHARED_OWNER_ID : user.id);
     res.json({ document: newDoc });
   } catch (error: any) {
-    res.status(500).json({ error: error?.message || 'Failed to add document' });
+    console.error('Add document error:', error);
+    res.status(500).json({ error: 'Could not add the document.' });
   }
 });
 
@@ -279,7 +300,7 @@ app.post('/api/rag/upload-file', async (req, res) => {
   try {
     const { fileName, fileType, fileBase64 } = req.body;
     if (!fileName || !fileBase64) {
-      return res.status(400).json({ error: 'ফাইল নাম ও কন্টেন্ট প্রদান করা আবশ্যক।' });
+      return res.status(400).json({ error: 'File name and content are required.' });
     }
 
     let extractedText = '';
@@ -316,7 +337,7 @@ app.post('/api/rag/upload-file', async (req, res) => {
             extractedText = localExtracted.trim();
           } else {
             console.warn('PDF AI extraction error:', pdfErr?.message);
-            throw new Error('মডেলটিতে সাময়িক চাপ বেশি রয়েছে। অনুগ্রহ করে কয়েক সেকেন্ড পর পুনরায় চেষ্টা করুন।');
+            throw pdfErr;
           }
         }
       } else if (localExtracted && localExtracted.trim().length > 60) {
@@ -331,7 +352,7 @@ app.post('/api/rag/upload-file', async (req, res) => {
     }
 
     if (!extractedText.trim()) {
-      return res.status(400).json({ error: 'নথি থেকে কোনো পড়ার উপযোগী টেক্সট পাওয়া যায়নি।' });
+      return res.status(400).json({ error: 'No readable text was found in the file.' });
     }
 
     // Generate brief 2-sentence summary in Bengali (safe with fallback)
@@ -368,16 +389,7 @@ app.post('/api/rag/upload-file', async (req, res) => {
     });
   } catch (error: any) {
     console.error('File upload error:', error);
-    let friendlyMessage = 'নথি প্রসেসিংয়ে সমস্যা হয়েছে, অনুগ্রহ করে আবার চেষ্টা করুন।';
-    const rawMsg = error?.message || '';
-    if (rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE') || rawMsg.includes('high demand')) {
-      friendlyMessage = 'মডেলটিতে সাময়িক চাপ বেশি রয়েছে। অনুগ্রহ করে কয়েক সেকেন্ড পর পুনরায় চেষ্টা করুন।';
-    } else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
-      friendlyMessage = 'অনুরোধের সীমা পূর্ণ হয়েছে, অনুগ্রহ করে কিছুক্ষণ পর চেষ্টা করুন।';
-    } else if (typeof rawMsg === 'string' && !rawMsg.startsWith('{') && rawMsg.length < 150) {
-      friendlyMessage = rawMsg;
-    }
-    res.status(500).json({ error: friendlyMessage });
+    res.status(500).json({ error: toFriendlyError(error, 'Could not process the file. Please try again.') });
   }
 });
 
@@ -388,11 +400,11 @@ app.post('/api/transcribe', async (req, res) => {
   const startTime = Date.now();
   try {
     if (!ai) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in server environment.' });
+      return res.status(500).json({ error: NO_API_KEY_MESSAGE });
     }
     const { audioBase64, mimeType = 'audio/webm' } = req.body;
     if (!audioBase64) {
-      return res.status(400).json({ error: 'Audio base64 data is required' });
+      return res.status(400).json({ error: 'No audio received. Please speak again.' });
     }
 
     const audioPart = {
@@ -419,7 +431,7 @@ app.post('/api/transcribe', async (req, res) => {
     if (transcribedText) {
       if (isAdminUser(user)) {
         ragEngine.addDocument({
-          title: `Admin voice information - ${new Date().toISOString().slice(0, 10)}`,
+          title: `Admin voice note - ${new Date().toISOString().slice(0, 10)}`,
           category: 'custom',
           content: transcribedText,
           summary: transcribedText.slice(0, 160) + (transcribedText.length > 160 ? '...' : ''),
@@ -442,7 +454,7 @@ app.post('/api/transcribe', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Transcription error:', error);
-    res.status(500).json({ error: error?.message || 'Failed to transcribe audio' });
+    res.status(500).json({ error: toFriendlyError(error, 'Could not recognise the speech. Please try again.') });
   }
 });
 
@@ -453,11 +465,11 @@ app.post('/api/tts', async (req, res) => {
   try {
     const { text } = req.body;
     if (!text) {
-      return res.status(400).json({ error: 'Text is required for TTS' });
+      return res.status(400).json({ error: 'Text is required to generate speech.' });
     }
 
     if (!ai && !isElevenLabsEnabled()) {
-      return res.status(500).json({ error: 'No TTS provider is configured in server environment.' });
+      return res.status(500).json({ error: 'No voice service (ElevenLabs or Gemini) is configured on the server.' });
     }
 
     const audio = await generateSpeech(ai, text);
@@ -468,7 +480,7 @@ app.post('/api/tts', async (req, res) => {
     });
   } catch (error: any) {
     console.error('TTS error:', error);
-    res.status(500).json({ error: error?.message || 'Failed to generate speech' });
+    res.status(500).json({ error: toFriendlyError(error, 'Could not generate the voice. Please try again.') });
   }
 });
 
@@ -484,7 +496,7 @@ app.get('/api/admin/voice', async (req, res) => {
     res.json({ enabled: true, voiceId: getActiveVoiceId(), voices });
   } catch (error: any) {
     console.error('Voice list error:', error);
-    res.status(502).json({ error: 'কণ্ঠের তালিকা লোড করা যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।' });
+    res.status(502).json({ error: 'Could not load the voice list. Please try again shortly.' });
   }
 });
 
@@ -495,16 +507,16 @@ app.put('/api/admin/voice', async (req, res) => {
   try {
     const { voiceId } = req.body;
     if (typeof voiceId !== 'string' || !voiceId) {
-      return res.status(400).json({ error: 'একটি কণ্ঠ নির্বাচন করুন।' });
+      return res.status(400).json({ error: 'Please choose a voice.' });
     }
     await selectVoice(voiceId, user.email);
     res.json({ voiceId });
   } catch (error: any) {
     if (error?.message === 'UNKNOWN_VOICE') {
-      return res.status(400).json({ error: 'এই কণ্ঠটি পাওয়া যায়নি। তালিকা হালনাগাদ করে আবার চেষ্টা করুন।' });
+      return res.status(400).json({ error: 'That voice was not found. Refresh the list and try again.' });
     }
     console.error('Voice update error:', error);
-    res.status(500).json({ error: 'কণ্ঠ সংরক্ষণ করা যায়নি। আবার চেষ্টা করুন।' });
+    res.status(500).json({ error: 'Could not save the voice. Please try again.' });
   }
 });
 
@@ -515,13 +527,13 @@ app.post('/api/admin/voice/preview', async (req, res) => {
   try {
     const { voiceId } = req.body;
     if (typeof voiceId !== 'string' || !voiceId) {
-      return res.status(400).json({ error: 'একটি কণ্ঠ নির্বাচন করুন।' });
+      return res.status(400).json({ error: 'Please choose a voice.' });
     }
     const audio = await generateElevenLabsSpeech(BENGALI_GREETING, voiceId);
     res.json({ audioBase64: audio.buffer.toString('base64'), mimeType: audio.mimeType });
   } catch (error: any) {
     console.error('Voice preview error:', error);
-    res.status(502).json({ error: 'এই কণ্ঠটি এখন শোনানো যাচ্ছে না। আবার চেষ্টা করুন।' });
+    res.status(502).json({ error: 'Cannot play this voice right now. Please try again.' });
   }
 });
 
@@ -532,12 +544,12 @@ app.post('/api/rag/query', async (req, res) => {
   const startTime = Date.now();
   try {
     if (!ai) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured in server environment.' });
+      return res.status(500).json({ error: NO_API_KEY_MESSAGE });
     }
 
     const { message, mode = 'standard', voiceName = 'Kore', enableRag = true, categoryFilter } = req.body;
     if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'Valid query message is required' });
+      return res.status(400).json({ error: 'Please type or say your question.' });
     }
 
     // 1. Retrieve Knowledge Chunks via RAG Engine
@@ -585,7 +597,8 @@ app.post('/api/rag/query', async (req, res) => {
 ৫. কোনো তথ্য জানা না থাকলে বানোয়াট কিছু না বলে শান্তভাবে জানিয়ে দাও।
 ৬. ব্যবহারকারী যদি নোয়াখালী, চট্টগ্রাম বা সিলেটের আঞ্চলিক উপভাষায় কথা বলেন, তবে তা আন্তরিকভাবে বুঝে প্রমিত বাংলায় প্রাঞ্জল উত্তর দাও।
 ৭. উত্তরটি মুখে শোনার (TTS) জন্য অত্যন্ত শ্রুতিমধুর, স্পষ্ট, আকর্ষণীয়, স্বাভাবিক ও অনর্থক প্রতীকবিহীন (clean spoken Bengali) করো।
-৮. কোনো Markdown, তালিকা, Asterisk, কমান্ড, code block, বা অনাবশ্যক চিহ্ন ব্যবহার করো না; শুধু স্বাভাবিক কথা বলার ভাষায় লিখবে।`;
+৮. কোনো Markdown, তালিকা, Asterisk, কমান্ড, code block, বা অনাবশ্যক চিহ্ন ব্যবহার করো না; শুধু স্বাভাবিক কথা বলার ভাষায় লিখবে।
+৯. ব্যবহারকারী ইংরেজি বা অন্য যেকোনো ভাষায় প্রশ্ন করলেও উত্তর সবসময় শুধু বাংলায় (বাংলা লিপিতে) দেবে।`;
 
     const userPrompt = `ব্যবহারকারীর বার্তা বা প্রশ্ন: "${message}"\n\n` +
       (contextBlock ? `${contextBlock}\n\n` : '') +
@@ -637,7 +650,7 @@ app.post('/api/rag/query', async (req, res) => {
     });
   } catch (error: any) {
     console.error('RAG query error:', error);
-    res.status(500).json({ error: error?.message || 'Failed to process RAG query' });
+    res.status(500).json({ error: toFriendlyError(error, 'Could not generate an answer. Please try again.') });
   }
 });
 
@@ -661,6 +674,7 @@ server.on('upgrade', (request, socket, head) => {
 wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) => {
   console.log('Client connected to Live audio WebSocket');
   let liveSession: any = null;
+  let liveClosed = false;
   let pendingInputTranscript = '';
   // Gemini is still producing the current answer (between its first output and generationComplete)
   let modelGenerating = false;
@@ -680,7 +694,7 @@ wss.on('connection', async (clientWs: WebSocket, request: http.IncomingMessage) 
 
   try {
     if (!ai) {
-      clientWs.send(JSON.stringify({ error: 'Gemini API Key missing on server' }));
+      clientWs.send(JSON.stringify({ error: NO_API_KEY_MESSAGE }));
       clientWs.close();
       return;
     }
@@ -717,7 +731,7 @@ ${uploadedFilesGrounding}
 ${storedMemoryGrounding}
 Standard Knowledge Base Context:
 ${standardKnowledgeSnippets}
-Speak warmly and naturally in Bengali. You prioritize information from user uploaded files when asked.
+Speak warmly and naturally in Bengali. Always answer in Bangla (Bengali script), even if the user speaks English or any other language. You prioritize information from user uploaded files when asked.
 Talk like a real Bangladeshi person in a friendly conversation, not like a machine reading text. Give complete, well-explained answers: usually several sentences that fully cover what the user asked, with helpful details and examples. Only keep it brief for greetings, small talk, or when the user asks for a short answer. Use natural spoken sentences with proper punctuation (। , ?), and never use lists, symbols, or markdown.`;
 
     // Connect to Gemini Live API: gemini-3.1-flash-live-preview
@@ -733,8 +747,10 @@ Talk like a real Bangladeshi person in a friendly conversation, not like a machi
           },
         },
         systemInstruction,
-        inputAudioTranscription: {},
-        ...(speechRelay ? { outputAudioTranscription: {} } : {}),
+        // Without a language hint, Bangla speech was sometimes written down as Hindi, Spanish or Portuguese
+        inputAudioTranscription: { languageCodes: ['bn-BD'] },
+        // ElevenLabs speaks this transcript, so it must be in Bangla script too
+        ...(speechRelay ? { outputAudioTranscription: { languageCodes: ['bn-BD'] } } : {}),
         realtimeInputConfig: {
           automaticActivityDetection: {
             // Only clear, sustained speech starts a user turn, not background voices or noise
@@ -760,7 +776,7 @@ Talk like a real Bangladeshi person in a friendly conversation, not like a machi
             pendingInputTranscript = '';
             if (isAdminUser(user)) {
               ragEngine.addDocument({
-                title: `Admin live voice information - ${new Date().toISOString().slice(0, 10)}`,
+                title: `Admin voice note - ${new Date().toISOString().slice(0, 10)}`,
                 category: 'custom',
                 content: transcript,
                 summary: transcript.slice(0, 160) + (transcript.length > 160 ? '...' : ''),
@@ -822,14 +838,24 @@ Talk like a real Bangladeshi person in a friendly conversation, not like a machi
         },
         onclose: (e: any) => {
           console.log('Gemini Live session closed:', e?.code, e?.reason || '');
+          liveClosed = true;
           liveSession = null;
-          // Let the client know so it can reconnect instead of streaming into a dead session
           if (clientWs.readyState === WebSocket.OPEN) {
+            // Billing, API key or quota problems: tell the user why, so the client stops instead of reconnecting
+            const reason = e?.code !== 1000 ? toFriendlyError(e?.reason || '', '') : '';
+            if (reason) clientWs.send(JSON.stringify({ error: reason }));
+            // Otherwise let the client know so it can reconnect instead of streaming into a dead session
             clientWs.close(1011, 'Live session ended');
           }
         },
       },
     });
+    // Gemini ended the session while it was starting; the client has already been told
+    if (liveClosed) {
+      liveSession = null;
+      speechRelay?.close();
+      return;
+    }
 
     // Speak the welcome greeting as soon as the user starts a voice session
     const { searchParams } = new URL(request.url || '', `http://${request.headers.host}`);
@@ -886,7 +912,7 @@ Talk like a real Bangladeshi person in a friendly conversation, not like a machi
   } catch (liveErr: any) {
     console.error('Live connect error:', liveErr);
     if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({ error: liveErr?.message || 'Live session failed' }));
+      clientWs.send(JSON.stringify({ error: toFriendlyError(liveErr, 'Could not start the voice session. Please try again.') }));
     }
   }
 });
@@ -895,7 +921,8 @@ Talk like a real Bangladeshi person in a friendly conversation, not like a machi
 async function setupViteMiddleware() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      // Hot reload shares the app's port, so a second copy of the app cannot collide on Vite's own port
+      server: { middlewareMode: true, hmr: process.env.DISABLE_HMR === 'true' ? false : { server } },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -908,23 +935,30 @@ async function setupViteMiddleware() {
   }
 
   const startServerOnPort = (port: number) => {
-    server.once('error', (error: NodeJS.ErrnoException) => {
+    const onListening = () => {
+      server.off('error', onError);
+      console.log(`বাংলা এআই সহকারী চালু হয়েছে: http://localhost:${port}`);
+    };
+    const onError = (error: NodeJS.ErrnoException) => {
+      server.off('listening', onListening);
       if (error.code === 'EADDRINUSE') {
         const nextPort = port + 1;
-        console.warn(`Port ${port} is already in use. Retrying on ${nextPort}...`);
+        console.warn(`পোর্ট ${port} ব্যস্ত (হয়তো অ্যাপটি আগে থেকেই চালু আছে)। ${nextPort} পোর্টে চেষ্টা করা হচ্ছে...`);
         startServerOnPort(nextPort);
         return;
       }
-      console.error('Server startup error:', error);
+      console.error('সার্ভার চালু করা যায়নি:', error);
       process.exit(1);
-    });
-
-    server.listen(port, '0.0.0.0', () => {
-      console.log(`Bangladeshi Bangla Voice AI Server running on http://localhost:${port}`);
-    });
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, '0.0.0.0');
   };
 
   startServerOnPort(PORT);
 }
 
-setupViteMiddleware();
+setupViteMiddleware().catch((error) => {
+  console.error('সার্ভার চালু করা যায়নি:', error);
+  process.exit(1);
+});

@@ -11,7 +11,7 @@ interface VoiceSettingsPanelProps {
   onClose: () => void;
 }
 
-const GENDER_LABELS: Record<string, string> = { female: 'নারী', male: 'পুরুষ', neutral: 'নিরপেক্ষ' };
+const GENDER_LABELS: Record<string, string> = { female: 'female', male: 'male', neutral: 'neutral' };
 
 function voiceLabel(voice: VoiceOption): string {
   const gender = voice.gender && GENDER_LABELS[voice.gender];
@@ -23,7 +23,7 @@ async function readJson(res: Response): Promise<any> {
   try {
     return await res.json();
   } catch {
-    throw new Error('কণ্ঠ সেটিংস পাওয়া যাচ্ছে না। সার্ভারটি পুনরায় চালু করে আবার চেষ্টা করুন।');
+    throw new Error('Could not load the voice settings. Restart the server and try again.');
   }
 }
 
@@ -47,13 +47,13 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
     try {
       const res = await fetch(`/api/admin/voice${refresh ? '?refresh=1' : ''}`);
       const data = await readJson(res);
-      if (!res.ok) throw new Error(data.error || 'কণ্ঠের তালিকা লোড করা যায়নি।');
+      if (!res.ok) throw new Error(data.error || 'Could not load the voice list.');
       setEnabled(data.enabled);
       setVoices(data.voices || []);
       setActiveVoiceId(data.voiceId);
       setSelectedVoiceId((current) => current || data.voiceId || data.voices?.[0]?.voiceId || '');
     } catch (err: any) {
-      setError(err?.message || 'কণ্ঠের তালিকা লোড করা যায়নি।');
+      setError(err?.message || 'Could not load the voice list.');
     } finally {
       setIsLoading(false);
     }
@@ -86,7 +86,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
         body: JSON.stringify({ voiceId: selectedVoiceId }),
       });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(data.error || 'এই কণ্ঠটি এখন শোনানো যাচ্ছে না।');
+      if (!res.ok) throw new Error(data.error || 'Cannot play this voice right now.');
       // The preview was stopped or another voice was chosen while this one was loading
       if (requestId !== previewRequestRef.current) return;
       const audio = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
@@ -95,7 +95,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
       await audio.play();
     } catch (err: any) {
       if (requestId !== previewRequestRef.current) return;
-      setError(err?.message || 'এই কণ্ঠটি এখন শোনানো যাচ্ছে না।');
+      setError(err?.message || 'Cannot play this voice right now.');
       setIsPreviewing(false);
     }
   };
@@ -111,11 +111,11 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
         body: JSON.stringify({ voiceId: selectedVoiceId }),
       });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(data.error || 'কণ্ঠ সংরক্ষণ করা যায়নি।');
+      if (!res.ok) throw new Error(data.error || 'Could not save the voice.');
       setActiveVoiceId(data.voiceId);
-      setSavedMessage('কণ্ঠ সংরক্ষিত হয়েছে। সব ব্যবহারকারীর পরবর্তী উত্তরে এটি ব্যবহৃত হবে।');
+      setSavedMessage('Voice saved. It will be used for every user\'s next answer.');
     } catch (err: any) {
-      setError(err?.message || 'কণ্ঠ সংরক্ষণ করা যায়নি।');
+      setError(err?.message || 'Could not save the voice.');
     } finally {
       setIsSaving(false);
     }
@@ -132,7 +132,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
         <div className="mb-5 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Volume2 className="h-5 w-5 text-emerald-400" />
-            <h2 className="text-lg font-semibold">এআই কণ্ঠ নির্বাচন</h2>
+            <h2 className="text-lg font-semibold">Choose the AI voice</h2>
           </div>
           <button type="button" onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Close">
             <X className="h-5 w-5" />
@@ -141,20 +141,20 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
 
         {isLoading ? (
           <div className="flex items-center gap-2 py-8 text-sm text-slate-400">
-            <Loader2 className="h-4 w-4 animate-spin" /> কণ্ঠের তালিকা লোড হচ্ছে...
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading voices...
           </div>
         ) : !enabled ? (
-          <p className="py-4 text-sm text-slate-400">কণ্ঠ পরিষেবা চালু নেই। সার্ভারে ভয়েস API কী সেট করুন।</p>
+          <p className="py-4 text-sm text-slate-400">The voice service is off. Set the voice API key on the server.</p>
         ) : (
           <>
             {activeVoice && (
               <p className="mb-3 text-xs text-slate-400">
-                বর্তমান কণ্ঠ: <span className="text-emerald-300">{voiceLabel(activeVoice)}</span>
+                Current voice: <span className="text-emerald-300">{voiceLabel(activeVoice)}</span>
               </p>
             )}
 
             <label htmlFor="voice-select" className="mb-1.5 block text-xs font-medium text-slate-300">
-              আপনার কণ্ঠসমূহ (My voices)
+              Your voices
             </label>
             <div className="flex gap-2">
               <select
@@ -168,7 +168,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
                 disabled={voices.length === 0}
                 className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500 disabled:opacity-60"
               >
-                {voices.length === 0 && <option value="">কোনো কণ্ঠ পাওয়া যায়নি</option>}
+                {voices.length === 0 && <option value="">No voices found</option>}
                 {voices.map((voice) => (
                   <option key={voice.voiceId} value={voice.voiceId}>{voiceLabel(voice)}</option>
                 ))}
@@ -177,8 +177,8 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
                 type="button"
                 onClick={() => loadVoices(true)}
                 className="rounded-lg border border-slate-700 bg-slate-800 px-2.5 text-slate-300 hover:border-emerald-500/50 hover:text-emerald-300"
-                title="তালিকা হালনাগাদ করুন"
-                aria-label="তালিকা হালনাগাদ করুন"
+                title="Refresh list"
+                aria-label="Refresh list"
               >
                 <RefreshCw className="h-4 w-4" />
               </button>
@@ -192,7 +192,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
                 className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3.5 py-2 text-sm text-slate-200 hover:border-emerald-500/50 disabled:opacity-50"
               >
                 {isPreviewing ? <Square className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                {isPreviewing ? 'থামান' : 'শুনে দেখুন'}
+                {isPreviewing ? 'Stop' : 'Preview'}
               </button>
               <button
                 type="button"
@@ -201,7 +201,7 @@ export const VoiceSettingsPanel: React.FC<VoiceSettingsPanelProps> = ({ onClose 
                 className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
               >
                 {isSaving && <Loader2 className="h-4 w-4 animate-spin" />}
-                সংরক্ষণ করুন
+                Save
               </button>
             </div>
           </>

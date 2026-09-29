@@ -25,13 +25,35 @@ import { VoiceSettingsPanel } from './components/VoiceSettingsPanel';
 
 type VoiceState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error';
 
+// Reconnects in a row without the AI ever answering before the voice session gives up
+const MAX_LIVE_RECONNECTS = 3;
+
+const MODE_OPTIONS: { key: ModelMode; label: string }[] = [
+  { key: 'high_thinking', label: 'Deep thinking' },
+  { key: 'fast', label: 'Fast' },
+  { key: 'standard', label: 'Standard' },
+];
+
+const formatNumber = (value: number) => value.toLocaleString('en-US');
+
+/** Admin voice notes are titled like "Admin live voice information - 2026-09-25" or "Admin voice note - 2026-09-27" */
+function displayDocTitle(title: string): string {
+  const match = title.match(/^Admin (?:live )?voice (?:information|note) - (\d{4}-\d{2}-\d{2})$/);
+  return match ? `Admin voice note - ${formatDate(match[1])}` : title;
+}
+
+function formatDate(isoDate: string): string {
+  const date = new Date(isoDate);
+  return Number.isNaN(date.getTime()) ? isoDate : date.toLocaleDateString('en-GB', { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
 export default function App() {
   const [user, setUser] = useState<{ id: string; email: string; createdAt: string; isAdmin?: boolean } | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [selectedMode, setSelectedMode] = useState<ModelMode>('standard');
   const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [volumeLevel, setVolumeLevel] = useState<number>(0);
-  const [statusMessage, setStatusMessage] = useState<string>('কথা বলতে বোতামে চাপ দিন');
+  const [statusMessage, setStatusMessage] = useState<string>('Tap the button to talk');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isVoicePanelOpen, setIsVoicePanelOpen] = useState(false);
 
@@ -46,11 +68,9 @@ export default function App() {
     } catch {
       const trimmed = rawText.replace(/\s+/g, ' ').slice(0, 220);
       const contentType = response.headers.get('content-type') || '';
-      const serverHint = contentType.includes('text/html')
-        ? 'The server responded with HTML instead of JSON. The backend may be offline or still starting.'
-        : trimmed
-          ? `Server returned a non-JSON response: ${trimmed}`
-          : fallbackMessage;
+      const serverHint = contentType.includes('text/html') || !trimmed
+        ? 'The server did not respond correctly. Make sure it is running and try again.'
+        : fallbackMessage;
       throw new Error(serverHint);
     }
   };
@@ -76,6 +96,7 @@ export default function App() {
   const shouldReconnectLiveRef = useRef(false);
   const liveReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveHasConnectedRef = useRef(false);
+  const liveReconnectAttemptsRef = useRef(0);
   const micAudioCtxRef = useRef<AudioContext | null>(null);
   const micMediaStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -94,7 +115,7 @@ export default function App() {
     try {
       const res = await fetch('/api/rag/custom-documents');
       if (res.ok) {
-        const data = await readJsonResponse<{ documents?: KnowledgeDocument[] }>(res, 'Stored documents could not be loaded.');
+        const data = await readJsonResponse<{ documents?: KnowledgeDocument[] }>(res, 'Could not load the stored documents.');
         setStoredDocs(data.documents || []);
       }
     } catch (e) {
@@ -105,16 +126,16 @@ export default function App() {
   useEffect(() => {
     fetch('/api/auth/me')
       .then(async (res) => {
-        const data = await readJsonResponse<{ user?: { id: string; email: string; createdAt: string; isAdmin?: boolean } | null }>(res, 'Authentication state could not be loaded.');
+        const data = await readJsonResponse<{ user?: { id: string; email: string; createdAt: string; isAdmin?: boolean } | null }>(res, 'Could not check the login status.');
         setUser(data.user || null);
-        if (data.user) fetchStoredDocuments();
+        if (data.user?.isAdmin) fetchStoredDocuments();
       })
       .catch(() => setUser(null))
       .finally(() => setAuthChecked(true));
     pcmPlayerRef.current = new GaplessPcmPlayer(24000);
     pcmPlayerRef.current.setOnEnded(() => {
       setVoiceState((current) => (current === 'speaking' ? 'listening' : current));
-      setStatusMessage('শুনছি... কথা বলুন');
+      setStatusMessage('Listening... go ahead');
     });
 
     return () => {
@@ -176,7 +197,7 @@ export default function App() {
     }
     setVoiceState('idle');
     setVolumeLevel(0);
-    setStatusMessage('কথা বলতে বোতামে চাপ দিন');
+    setStatusMessage('Tap the button to talk');
   };
 
   const releaseLiveTransport = () => {
@@ -196,9 +217,10 @@ export default function App() {
 
   const startVoiceSession = async (isReconnect = false) => {
     shouldReconnectLiveRef.current = true;
+    if (!isReconnect) liveReconnectAttemptsRef.current = 0;
     setErrorMessage(null);
     setVoiceState('connecting');
-    setStatusMessage('সংযোগ স্থাপন হচ্ছে...');
+    setStatusMessage('Connecting...');
 
     try {
       if (!pcmPlayerRef.current) {
@@ -231,6 +253,11 @@ export default function App() {
               voiceIsolation: true,
             } as MediaTrackConstraints,
           });
+          // The session ended (e.g. a server error) while the browser was asking for the mic
+          if (liveWsRef.current !== ws) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
           micMediaStreamRef.current = stream;
 
           const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -288,7 +315,7 @@ export default function App() {
             userSpeech.forEach(sendAudio);
             speakerGateRef.current.forceOpen();
             setVoiceState('listening');
-            setStatusMessage('শুনছি... বলুন');
+            setStatusMessage('Listening... go ahead');
           };
 
           source.connect(rumbleFilter);
@@ -296,10 +323,10 @@ export default function App() {
           processor.connect(audioCtx.destination);
 
           setVoiceState('listening');
-          setStatusMessage('শুনছি... বাংলায় বলুন');
+          setStatusMessage('Listening... speak in Bangla');
         } catch (err: any) {
           console.error('Microphone error:', err);
-          setErrorMessage('মাইক্রোফোন ব্যবহারের অনুমতি প্রয়োজন।');
+          setErrorMessage('Microphone permission is required.');
           stopVoiceSession();
         }
       };
@@ -319,17 +346,20 @@ export default function App() {
             awaitingInterruptAckRef.current = false;
           }
 
+          // The AI answered, so the connection works: allow fresh reconnects later
+          if (data.audio) liveReconnectAttemptsRef.current = 0;
+
           // Skip what is left of a reply the user talked over
           if (data.audio && !awaitingInterruptAckRef.current) {
             setVoiceState('speaking');
-            setStatusMessage('এআই উত্তর দিচ্ছে...');
+            setStatusMessage('AI is answering...');
             pcmPlayerRef.current?.queuePcmBase64(data.audio);
           }
 
           if (data.interrupted) {
             pcmPlayerRef.current?.stop();
             setVoiceState('listening');
-            setStatusMessage('শুনছি... বলুন');
+            setStatusMessage('Listening... go ahead');
           }
         } catch (err) {
           console.warn('WS message error:', err);
@@ -345,10 +375,15 @@ export default function App() {
         if (shouldReconnectLiveRef.current) {
           const wasConnected = liveHasConnectedRef.current;
           liveHasConnectedRef.current = false;
-          if (wasConnected) {
+          if (wasConnected && liveReconnectAttemptsRef.current >= MAX_LIVE_RECONNECTS) {
+            // The session keeps dropping before the AI says anything: stop instead of looping forever
+            stopVoiceSession();
+            setErrorMessage('The voice connection keeps dropping. Check your internet connection and try again later.');
+          } else if (wasConnected) {
+            liveReconnectAttemptsRef.current++;
             releaseLiveTransport();
             setVoiceState('connecting');
-            setStatusMessage('সংযোগ পুনরায় স্থাপন হচ্ছে...');
+            setStatusMessage('Reconnecting...');
             liveReconnectTimerRef.current = setTimeout(() => {
               liveReconnectTimerRef.current = null;
               startVoiceSession(true);
@@ -367,7 +402,7 @@ export default function App() {
 
   const startFallbackVoiceQuery = async () => {
     try {
-      setStatusMessage('শুনছি... বলুন');
+      setStatusMessage('Listening... go ahead');
       setVoiceState('listening');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micMediaStreamRef.current = stream;
@@ -385,11 +420,11 @@ export default function App() {
         mediaRecorderRef.current = null;
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
         if (audioBlob.size === 0) {
-          setErrorMessage('কোনো অডিও রেকর্ড হয়নি। আবার চেষ্টা করুন।');
+          setErrorMessage('No audio was recorded. Please try again.');
           setVoiceState('idle');
           return;
         }
-        setStatusMessage('প্রক্রিয়াকরণ হচ্ছে...');
+        setStatusMessage('Processing...');
         setVoiceState('connecting');
 
         const reader = new FileReader();
@@ -405,15 +440,15 @@ export default function App() {
             });
             const transData = await readJsonResponse<{ text?: string; error?: string }>(
               transRes,
-              'কণ্ঠের কথা শনাক্ত করা যায়নি। সার্ভার উত্তর দিচ্ছে না।',
+              'Could not recognise the speech. The server is not responding.',
             );
             if (!transRes.ok) {
-              throw new Error(transData.error || 'কণ্ঠের কথা শনাক্ত করা যায়নি');
+              throw new Error(transData.error || 'Could not recognise the speech');
             }
             const transcribed = transData.text;
 
             if (!transcribed) {
-              setStatusMessage('কিছু শুনতে পাইনি, পুনরায় চেষ্টা করুন');
+              setStatusMessage('Didn\'t catch that, please try again');
               setVoiceState('idle');
               return;
             }
@@ -426,24 +461,24 @@ export default function App() {
             });
             const queryData = await readJsonResponse<{ text?: string; error?: string; audioBase64?: string; audioMimeType?: string }>(
               queryRes,
-              'এআই উত্তর তৈরি করা যায়নি। সার্ভার না থাকলে আবার চেষ্টা করুন।',
+              'Could not generate an answer. Please try again.',
             );
             if (!queryRes.ok) {
-              throw new Error(queryData.error || 'উত্তর তৈরি করা যায়নি');
+              throw new Error(queryData.error || 'Could not generate an answer');
             }
 
             if (queryData.audioBase64) {
               setVoiceState('speaking');
-              setStatusMessage('এআই উত্তর দিচ্ছে...');
+              setStatusMessage('AI is answering...');
               const audio = new Audio(`data:${queryData.audioMimeType || 'audio/mpeg'};base64,${queryData.audioBase64}`);
               mp3AudioRef.current = audio;
               audio.onended = () => {
                 mp3AudioRef.current = null;
                 setVoiceState('idle');
-                setStatusMessage('কথা বলতে বোতামে চাপ দিন');
+                setStatusMessage('Tap the button to talk');
               };
               await audio.play().catch((playError) => {
-                throw new Error(`অডিও চালু করা যায়নি: ${playError?.message || 'ব্রাউজার অডিও অনুমতি দেয়নি'}`);
+                throw new Error(`Could not play audio: ${playError?.message || 'the browser blocked audio playback'}`);
               });
             } else if (queryData.text) {
               const ttsRes = await fetch('/api/tts', {
@@ -453,28 +488,28 @@ export default function App() {
               });
               const ttsData = await readJsonResponse<{ audioBase64?: string; error?: string; mimeType?: string }>(
                 ttsRes,
-                'Gemini কণ্ঠ তৈরি করা যায়নি। সার্ভার উত্তর দিচ্ছে না।',
+                'Could not generate the voice. The server is not responding.',
               );
               if (!ttsRes.ok || !ttsData.audioBase64) {
-                throw new Error(ttsData.error || 'Gemini কণ্ঠ তৈরি করা যায়নি');
+                throw new Error(ttsData.error || 'Could not generate the voice');
               }
               setVoiceState('speaking');
-              setStatusMessage('এআই উত্তর দিচ্ছে...');
+              setStatusMessage('AI is answering...');
               const audio = new Audio(`data:${ttsData.mimeType || 'audio/mpeg'};base64,${ttsData.audioBase64}`);
               mp3AudioRef.current = audio;
               audio.onended = () => {
                 mp3AudioRef.current = null;
                 setVoiceState('idle');
-                setStatusMessage('কথা বলতে বোতামে চাপ দিন');
+                setStatusMessage('Tap the button to talk');
               };
               await audio.play();
             } else {
-              setStatusMessage(queryData.text ? queryData.text.slice(0, 80) : 'সম্পন্ন');
+              setStatusMessage(queryData.text ? queryData.text.slice(0, 80) : 'Done');
               setVoiceState('idle');
             }
           } catch (e: any) {
             console.error('Voice request failed:', e);
-            setErrorMessage(e?.message || 'অনুরোধ সম্পন্ন করা যায়নি');
+            setErrorMessage(e?.message || 'The request could not be completed');
             setVoiceState('idle');
           }
         };
@@ -483,7 +518,7 @@ export default function App() {
       mediaRecorderRef.current = recorder;
       recorder.start(250);
     } catch (e: any) {
-      setErrorMessage('মাইক্রোফোন চালু করা যায়নি');
+      setErrorMessage('Could not start the microphone');
       setVoiceState('idle');
     }
   };
@@ -513,12 +548,12 @@ export default function App() {
     }
 
     if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
-      return 'মডেলটিতে সাময়িক চাপ বেশি রয়েছে। অনুগ্রহ করে কয়েক সেকেন্ড পর পুনরায় চেষ্টা করুন।';
+      return 'The model is busy right now. Please try again in a few seconds.';
     }
     if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
-      return 'অনুরোধের সীমা পূর্ণ হয়েছে, অনুগ্রহ করে একটু অপেক্ষা করে চেষ্টা করুন।';
+      return 'Request limit reached. Please wait a moment and try again.';
     }
-    return raw || 'নথি আপলোড ও প্রক্রিয়াকরণে সমস্যা হয়েছে। পুনরায় চেষ্টা করুন।';
+    return raw || 'Could not upload and process the file. Please try again.';
   };
 
   // Handle RAG File Upload (silently attaches to model, no notifications)
@@ -541,13 +576,13 @@ export default function App() {
             }),
           });
 
-          const data = await readJsonResponse<{ error?: string }>(response, 'Upload failed because the server did not return a valid JSON response.');
+          const data = await readJsonResponse<{ error?: string }>(response, 'Could not upload the file. The server did not respond correctly.');
           if (!response.ok) {
-            throw new Error(data.error || 'Upload failed');
+            throw new Error(data.error || 'Could not upload the file.');
           }
-          // Refresh stored documents list from disk and update LLM access
-          await fetchStoredDocuments();
-          setUploadSuccessMsg(`"${file.name}" সফলভাবে সংরক্ষিত এবং এলএলএম-এ সংযুক্ত হয়েছে`);
+          // Refresh the stored documents list (only admins can see it)
+          if (user?.isAdmin) await fetchStoredDocuments();
+          setUploadSuccessMsg(`"${file.name}" saved. The AI can now use it.`);
           setTimeout(() => setUploadSuccessMsg(null), 4000);
         } catch (uploadErr: any) {
           console.error('File upload error:', uploadErr);
@@ -561,7 +596,7 @@ export default function App() {
       };
     } catch (err: any) {
       console.error('File read error:', err);
-      setErrorMessage('নথি পড়া সম্ভব হয়নি');
+      setErrorMessage('Could not read the file');
       setIsUploading(false);
     }
   };
@@ -570,12 +605,16 @@ export default function App() {
     e.stopPropagation();
     setIsDeletingId(id);
     try {
-      const res = await fetch(`/api/rag/documents/${id}`, { method: 'DELETE' });
+      const res = await fetch(`/api/rag/documents/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (res.ok) {
         setStoredDocs((prev) => prev.filter((d) => d.id !== id));
+      } else {
+        const data = await readJsonResponse<{ error?: string }>(res, 'Could not delete the document.');
+        setErrorMessage(data.error || 'Could not delete the document.');
       }
     } catch (err) {
       console.error('Delete document error:', err);
+      setErrorMessage('Could not delete the document.');
     } finally {
       setIsDeletingId(null);
     }
@@ -602,7 +641,7 @@ export default function App() {
   const scale = voiceState === 'speaking' ? 1.08 : voiceState === 'listening' ? 1 + volumeLevel * 0.0025 : 1;
 
   if (!authChecked) return <div className="min-h-screen bg-slate-950" />;
-  if (!user) return <AuthScreen onAuthenticated={(authenticatedUser) => { setUser(authenticatedUser); fetchStoredDocuments(); }} />;
+  if (!user) return <AuthScreen onAuthenticated={(authenticatedUser) => { setUser(authenticatedUser); if (authenticatedUser.isAdmin) fetchStoredDocuments(); }} />;
 
   return (
     <main
@@ -619,15 +658,11 @@ export default function App() {
     >
       <div className="absolute top-5 left-1/2 z-20 -translate-x-1/2">
         <div className="flex items-center gap-2 rounded-xl border border-slate-700/80 bg-slate-900/80 p-1.5 shadow-lg shadow-black/20 backdrop-blur-md">
-          {[
-            { key: 'high_thinking', label: 'High Thinking' },
-            { key: 'fast', label: 'Fast' },
-            { key: 'standard', label: 'Standard' },
-          ].map((option) => (
+          {MODE_OPTIONS.map((option) => (
             <button
               key={option.key}
               type="button"
-              onClick={() => setSelectedMode(option.key as ModelMode)}
+              onClick={() => setSelectedMode(option.key)}
               className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
                 selectedMode === option.key
                   ? 'bg-emerald-600 text-white shadow-sm'
@@ -654,28 +689,33 @@ export default function App() {
           onClick={() => fileInputRef.current?.click()}
           disabled={isUploading}
           className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-emerald-500/40 text-xs font-medium text-slate-300 hover:text-emerald-300 shadow-md transition-all cursor-pointer backdrop-blur-md active:scale-95"
-          title="RAG-এ PDF, TXT বা MD ফাইল যুক্ত করুন"
+          title="Add a PDF, TXT, MD, JSON or CSV file for the AI to learn from"
         >
           <UploadCloud className={`w-4 h-4 ${isUploading ? 'animate-bounce text-emerald-400' : 'text-emerald-400'}`} />
-          <span>{isUploading ? 'যুক্ত হচ্ছে...' : 'File যুক্ত করুন '}</span>
+          <span>{isUploading ? 'Uploading...' : 'Add file'}</span>
         </button>
 
-        {storedDocs.length > 0 && (
-          <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-800/40 text-[11px] text-emerald-300 backdrop-blur-md">
+        {user.isAdmin && storedDocs.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setIsDocsModalOpen(true)}
+            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-800/40 text-[11px] text-emerald-300 backdrop-blur-md hover:border-emerald-500/60 cursor-pointer"
+            title="View stored documents"
+          >
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span>AI সক্রিয়</span>
-          </div>
+            <span>Stored documents ({formatNumber(storedDocs.length)})</span>
+          </button>
         )}
       </header>
       <div className="absolute right-6 top-5 z-20 flex items-center gap-3 text-xs text-slate-400">
         <span className="hidden sm:inline">{user.email}</span>
         {user.isAdmin && (
-          <button type="button" onClick={() => setIsVoicePanelOpen(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-emerald-500/50 hover:text-emerald-300" title="এআই কণ্ঠ নির্বাচন">
+          <button type="button" onClick={() => setIsVoicePanelOpen(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-emerald-500/50 hover:text-emerald-300" title="Choose the AI voice">
             <Volume2 className="h-3.5 w-3.5" />
             <span>Voice</span>
           </button>
         )}
-        <button type="button" onClick={handleLogout} className="rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-rose-500/50 hover:text-rose-300">Sign out</button>
+        <button type="button" onClick={handleLogout} className="rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 hover:border-rose-500/50 hover:text-rose-300">Log out</button>
       </div>
 
       {/* Subtle background radial glow */}
@@ -718,7 +758,7 @@ export default function App() {
           type="button"
           onClick={handleToggleVoice}
           style={{ transform: `scale(${scale})` }}
-          aria-label={isActive ? 'ভয়েস সহকারী বন্ধ করুন' : 'ভয়েস সহকারী চালু করুন'}
+          aria-label={isActive ? 'Stop the voice assistant' : 'Start the voice assistant'}
           className={`relative flex h-36 w-36 sm:h-44 sm:w-44 cursor-pointer items-center justify-center rounded-full transition-all duration-300 focus:outline-none ${
             voiceState === 'speaking'
               ? 'bg-gradient-to-tr from-emerald-600 via-teal-500 to-emerald-400 text-white shadow-2xl shadow-emerald-500/40 ring-4 ring-emerald-300/50'
@@ -740,7 +780,7 @@ export default function App() {
           )}
         </button>
 
-        {/* Minimal Bengali status state below button */}
+        {/* Minimal status text below button */}
         <div className="mt-8 text-center max-w-md">
           <p
             id="voice-status-text"
@@ -801,8 +841,8 @@ export default function App() {
         </div>
       </div>
 
-      {/* Stored Documents & LLM Access Modal */}
-      {isDocsModalOpen && (
+      {/* Stored Documents & LLM Access Modal (admin only) */}
+      {user.isAdmin && isDocsModalOpen && (
         <div
           id="stored-docs-modal-overlay"
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in pointer-events-auto"
@@ -821,14 +861,14 @@ export default function App() {
                 </div>
                 <div>
                   <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">
-                    সংরক্ষিত নথির ডেটা ও LLM অ্যাক্সেস
+                    Stored documents & AI knowledge base
                     <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-normal flex items-center gap-1">
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                      LLM-এ সক্রিয় ({storedDocs.length}টি নথি)
+                      Active in AI ({formatNumber(storedDocs.length)} documents)
                     </span>
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    ফাইল থেকে নিষ্কাশিত সমস্ত ডেটা স্থায়ীভাবে সংরক্ষিত রয়েছে এবং জেমিনি মডেল সরাসরি ব্যবহার করছে।
+                    Everything extracted from uploaded files is stored permanently and the AI uses it directly when answering.
                   </p>
                 </div>
               </div>
@@ -836,7 +876,7 @@ export default function App() {
                 type="button"
                 onClick={() => setIsDocsModalOpen(false)}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors cursor-pointer"
-                title="বন্ধ করুন"
+                title="Close"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -849,9 +889,9 @@ export default function App() {
                   <div className="p-4 rounded-2xl bg-slate-800/60 border border-slate-700/50 mb-3 text-slate-500">
                     <FileText className="w-8 h-8" />
                   </div>
-                  <h4 className="text-sm font-medium text-slate-200">এখনও কোনো ফাইল আপলোড করা হয়নি</h4>
+                  <h4 className="text-sm font-medium text-slate-200">No files uploaded yet</h4>
                   <p className="text-xs text-slate-400 mt-1 max-w-sm">
-                    যেকোনো PDF, TXT, MD বা CSV ফাইল আপলোড করুন। ফাইল থেকে অর্জিত তথ্য এখানে সংরক্ষিত হবে এবং এআই মডেল তাৎক্ষণিকভাবে তা জানতে পারবে।
+                    Upload any PDF, TXT, MD or CSV file. Its content is stored here and the AI can use it right away.
                   </p>
                   <button
                     type="button"
@@ -862,7 +902,7 @@ export default function App() {
                     className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white shadow-lg shadow-emerald-600/30 transition-all cursor-pointer active:scale-95"
                   >
                     <UploadCloud className="w-4 h-4" />
-                    <span>ফাইল আপলোড করুন</span>
+                    <span>Upload file</span>
                   </button>
                 </div>
               ) : (
@@ -881,15 +921,15 @@ export default function App() {
                             <FileText className="w-4 h-4" />
                           </div>
                           <div>
-                            <h4 className="text-sm font-semibold text-slate-200 break-all">{doc.title}</h4>
+                            <h4 className="text-sm font-semibold text-slate-200 break-all">{displayDocTitle(doc.title)}</h4>
                             <div className="flex flex-wrap items-center gap-2 mt-1 text-[11px] text-slate-400">
                               <span className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-slate-300">
-                                {doc.category || 'custom'}
+                                {!doc.category || doc.category === 'custom' ? 'Custom' : doc.category}
                               </span>
                               <span>•</span>
-                              <span>সংরক্ষণের তারিখ: {doc.createdAt}</span>
+                              <span>Saved: {formatDate(doc.createdAt)}</span>
                               <span>•</span>
-                              <span>{doc.content.length} অক্ষর</span>
+                              <span>{formatNumber(doc.content.length)} characters</span>
                             </div>
                           </div>
                         </div>
@@ -901,7 +941,7 @@ export default function App() {
                             onClick={(e) => handleDeleteDocument(doc.id, e)}
                             disabled={isDeleting}
                             className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/30 transition-colors cursor-pointer"
-                            title="সংরক্ষিত ফাইল ও LLM অ্যাক্সেস মুছুন"
+                            title="Delete document"
                           >
                             <Trash2 className={`w-4 h-4 ${isDeleting ? 'animate-spin text-rose-400' : ''}`} />
                           </button>
@@ -913,7 +953,7 @@ export default function App() {
                         <div className="mt-3 p-2.5 rounded-lg bg-slate-900/80 border border-slate-800 text-xs text-slate-300 flex items-start gap-2">
                           <Sparkles className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
                           <div>
-                            <span className="font-medium text-emerald-400">এআই সারাংশ: </span>
+                            <span className="font-medium text-emerald-400">AI summary: </span>
                             {doc.summary}
                           </div>
                         </div>
@@ -926,11 +966,11 @@ export default function App() {
                           onClick={() => setExpandedDocId(isExpanded ? null : doc.id)}
                           className="inline-flex items-center gap-1 text-xs font-medium text-teal-400 hover:text-teal-300 transition-colors cursor-pointer"
                         >
-                          <span>{isExpanded ? 'উদ্ধৃত ডেটা লুকান' : 'উদ্ধৃত ডেটা দেখুন (LLM Context)'}</span>
+                          <span>{isExpanded ? 'Hide stored content' : 'Show stored content'}</span>
                           {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                         </button>
                         <span className="text-[11px] text-emerald-400/80 font-medium">
-                          ✓ এলএলএম মডেলে অ্যাক্সেস নিশ্চিত
+                          ✓ Used by the AI
                         </span>
                       </div>
 
@@ -949,7 +989,7 @@ export default function App() {
             {/* Modal Footer */}
             <div className="flex items-center justify-between px-6 py-3.5 border-t border-slate-800 bg-slate-900/90 text-xs">
               <span className="text-slate-400">
-                মোট সংরক্ষিত ফাইল: <strong className="text-slate-200">{storedDocs.length}টি</strong>
+                Total stored files: <strong className="text-slate-200">{formatNumber(storedDocs.length)}</strong>
               </span>
               <div className="flex items-center gap-2.5">
                 <button
@@ -961,14 +1001,14 @@ export default function App() {
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium shadow transition-all cursor-pointer active:scale-95"
                 >
                   <UploadCloud className="w-3.5 h-3.5" />
-                  <span>{isUploading ? 'যুক্ত হচ্ছে...' : 'নতুন ফাইল আপলোড'}</span>
+                  <span>{isUploading ? 'Uploading...' : 'Upload new file'}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setIsDocsModalOpen(false)}
                   className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium transition-colors cursor-pointer"
                 >
-                  বন্ধ করুন
+                  Close
                 </button>
               </div>
             </div>
@@ -979,9 +1019,9 @@ export default function App() {
       {/* Drag & drop helper text at bottom */}
       <footer className="absolute bottom-5 text-center text-[11px] text-slate-500 pointer-events-none">
         {isDragging ? (
-          <span className="text-emerald-400 font-medium">নথিটি এখানে ছেড়ে দিন (RAG ইনডেক্সিংয়ের জন্য)...</span>
+          <span className="text-emerald-400 font-medium">Drop the file here and the AI will learn from it...</span>
         ) : (
-          <span>PDF বা TXT ফাইল ড্রপ করে যুক্ত করুন অথবা বোতামে চাপ দিয়ে কথা বলুন</span>
+          <span>Drop a PDF or TXT file to add it, or tap the button to talk</span>
         )}
       </footer>
 

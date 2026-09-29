@@ -66,6 +66,8 @@ function getConfig() {
       similarity_boost: numberEnv('ELEVENLABS_SIMILARITY', 0.75),
       use_speaker_boost: true,
       speed: numberEnv('ELEVENLABS_SPEED', 1.0),
+      // 0 = neutral delivery; higher values exaggerate the voice's own style
+      ...(process.env.ELEVENLABS_STYLE ? { style: numberEnv('ELEVENLABS_STYLE', 0) } : {}),
     },
   };
 }

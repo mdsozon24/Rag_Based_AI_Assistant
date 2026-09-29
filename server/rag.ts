@@ -207,11 +207,16 @@ export class RagEngine {
   }
 
   public deleteDocument(id: string, ownerUserId: string): boolean {
+    const isShared = ownerUserId === SHARED_OWNER_ID;
+    if (!isShared) this.loadUserDocuments(ownerUserId);
     const initialLen = this.documents.length;
     this.documents = this.documents.filter(d => d.id !== id || d.ownerUserId !== ownerUserId);
     const wasDeleted = this.documents.length < initialLen;
     if (wasDeleted) {
-      saveUserDocuments(ownerUserId, this.documents.filter((document) => document.isCustom && document.ownerUserId === ownerUserId));
+      // Shared documents live only in custom_documents.json, which savePersistedDocuments rewrites
+      if (!isShared) {
+        saveUserDocuments(ownerUserId, this.documents.filter((document) => document.isCustom && document.ownerUserId === ownerUserId));
+      }
       this.savePersistedDocuments();
     }
     return wasDeleted;
