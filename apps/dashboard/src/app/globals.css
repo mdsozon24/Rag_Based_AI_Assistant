@@ -1,0 +1,125 @@
+@import 'tailwindcss';
+
+/* Dark mode follows data-theme on <html>, set before first paint by the inline script in layout.tsx */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/*
+ * Colour tokens. Contrast (WCAG AA) checked for each pair used:
+ *   text on bg/surface >= 12:1, muted on bg/surface >= 4.5:1, accent text and accent button text >= 4.5:1,
+ *   control borders and focus rings >= 3:1 against their background.
+ */
+:root {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --text: #0f172a;
+  --muted: #4b5567;
+  --border: #e1e5eb;
+  --control: #737f93;
+  --accent: #0b6e8a;
+  --accent-hover: #095a71;
+  --accent-fg: #ffffff;
+  --accent-soft: #e2f3f8;
+  --accent-text: #075a72;
+  --danger: #b42318;
+  --danger-hover: #912018;
+  --danger-fg: #ffffff;
+  --danger-soft: #fdecea;
+  --success: #157a3c;
+  --success-soft: #e6f4ea;
+  --warning: #8a5300;
+  --warning-soft: #fdf3e1;
+  --info-soft: #e8eefc;
+  --info: #1e48b8;
+  --focus: #1d5fd1;
+  --overlay: rgb(15 23 42 / 0.45);
+  --shadow: 0 1px 2px rgb(15 23 42 / 0.06), 0 1px 3px rgb(15 23 42 / 0.08);
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --surface: #121a2b;
+  --surface-2: #1a2438;
+  --text: #e6eaf2;
+  --muted: #a3adbf;
+  --border: #263247;
+  --control: #7d8aa3;
+  --accent: #5cc8e4;
+  --accent-hover: #86d8ec;
+  --accent-fg: #062330;
+  --accent-soft: #10303d;
+  --accent-text: #7fd5ea;
+  --danger: #ff8a80;
+  --danger-hover: #ffb0a8;
+  --danger-fg: #1a0505;
+  --danger-soft: #3a1714;
+  --success: #6fdc95;
+  --success-soft: #11301f;
+  --warning: #f5c060;
+  --warning-soft: #33260c;
+  --info-soft: #182a52;
+  --info: #9db8ff;
+  --focus: #8ab4ff;
+  --overlay: rgb(0 0 0 / 0.6);
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.4);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-control: var(--control);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-text: var(--accent-text);
+  --color-danger: var(--danger);
+  --color-danger-hover: var(--danger-hover);
+  --color-danger-fg: var(--danger-fg);
+  --color-danger-soft: var(--danger-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-focus: var(--focus);
+  --color-overlay: var(--overlay);
+  --shadow-card: var(--shadow);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', 'Noto Sans Bengali', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* One visible focus style for every interactive element (keyboard users) */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

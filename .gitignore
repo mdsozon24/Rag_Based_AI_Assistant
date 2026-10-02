@@ -5,3 +5,11 @@ data/voice_settings.json
 node_modules
 dist/
 voice-samples/
+.data/
+packages/sdk/e2e/.tmp/
+test-results/
+playwright-report/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+apps/dashboard/e2e/.tmp/

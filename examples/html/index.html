@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice of Octo: widget example</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; line-height: 1.5; }
+    code { background: #f3f4f6; padding: 2px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Acme Clinic</h1>
+  <p>This page embeds the voice agent with one script tag. Use the button in the corner to talk to it, or choose <em>Type instead</em> to chat.</p>
+  <p>Replace <code>https://api.your-domain.com</code>, <code>pk_your_public_key</code> and <code>your_assistant_id</code> below. The public key must list this page's origin in its allowed origins.</p>
+
+  <!-- The whole integration: -->
+  <script
+    src="https://api.your-domain.com/sdk/widget.js"
+    data-public-key="pk_your_public_key"
+    data-assistant-id="your_assistant_id"
+    data-title="Ask Acme Clinic"
+    data-primary-color="#0f766e"
+    data-position="bottom-right"
+    data-mode="both"
+    async
+  ></script>
+</body>
+</html>

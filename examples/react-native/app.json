@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Octo Voice Example",
+    "slug": "octo-voice-example",
+    "version": "0.1.0",
+    "ios": {
+      "bundleIdentifier": "com.example.octovoice",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "The voice assistant needs the microphone to hear you."
+      }
+    },
+    "android": {
+      "package": "com.example.octovoice",
+      "permissions": ["android.permission.RECORD_AUDIO", "android.permission.MODIFY_AUDIO_SETTINGS"]
+    }
+  }
+}

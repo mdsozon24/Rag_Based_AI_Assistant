@@ -1,0 +1,19 @@
+{
+  "name": "@octo/web",
+  "version": "0.1.0",
+  "description": "Browser SDK and embeddable widget for Voice of Octo voice agents",
+  "private": true,
+  "type": "module",
+  "main": "./dist/octo-web.js",
+  "module": "./dist/octo-web.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./dist/octo-web.js",
+    "./widget": "./dist/widget.js"
+  },
+  "files": ["dist", "src", "README.md"],
+  "sideEffects": ["./src/widget/embed.ts", "./dist/widget.js"],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2020 --sourcemap --outfile=dist/octo-web.js && esbuild src/widget/embed.ts --bundle --format=iife --platform=browser --target=es2020 --minify --sourcemap --outfile=dist/widget.js"
+  }
+}

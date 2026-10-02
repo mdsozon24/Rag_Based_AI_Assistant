@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Engine Dev</title>
+<style>
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1d1d1f; --muted:#6b6b76; --line:#e3e3e8; --accent:#2f6fde; --ok:#1a8f4c; --warn:#b26b00; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141417; --card:#1d1d22; --text:#ececf1; --muted:#9a9aa6; --line:#2e2e36; --accent:#6c9cff; --ok:#4cc184; --warn:#e3a33b; --bad:#ff6b6b; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:960px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  label { color:var(--muted); font-size:13px; }
+  select, input { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--text); }
+  input[type=number] { width:80px; }
+  button { font:inherit; padding:7px 16px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .state { font-weight:600; padding:3px 10px; border-radius:99px; border:1px solid var(--line); }
+  .state[data-s=listening]{ color:var(--ok); } .state[data-s=thinking]{ color:var(--warn); } .state[data-s=speaking]{ color:var(--accent); } .state[data-s=ended]{ color:var(--muted); }
+  .meter { width:120px; height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:var(--ok); transition:width 60ms; }
+  #transcript { max-height:340px; overflow-y:auto; }
+  .msg { padding:6px 0; border-bottom:1px solid var(--line); }
+  .msg:last-child { border-bottom:0; }
+  .who { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .partial { color:var(--muted); font-style:italic; }
+  .cut { color:var(--warn); font-size:12px; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; font-size:13px; }
+  th, td { text-align:right; padding:4px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  td.good { color:var(--ok); } td.slow { color:var(--bad); }
+  .note { color:var(--muted); font-size:13px; }
+  .err { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice engine dev</h1>
+  <p class="sub">Cascaded pipeline: mic → VAD/endpointing → Scribe STT → Gemini → ElevenLabs TTS → speaker. Use headphones for the cleanest barge-in tests.</p>
+
+  <div class="card row">
+    <label>Language <select id="lang"><option value="bn">Bangla</option><option value="en">English</option></select></label>
+    <label>Preset <select id="preset"><option value="balanced">balanced</option><option value="fast">fast</option><option value="quality">quality</option></select></label>
+    <label><input type="checkbox" id="greet" checked> Assistant speaks first</label>
+    <label>Silence ms <input type="number" id="silence" value="600" min="100" max="5000" step="50"></label>
+    <button id="start">Start call</button>
+    <button id="stop" class="secondary" disabled>Hang up</button>
+    <span class="state" id="state" data-s="idle">idle</span>
+    <div class="meter" title="Mic level"><div id="level"></div></div>
+  </div>
+
+  <div class="card"><div id="transcript"><p class="note">Transcript appears here.</p></div></div>
+
+  <div class="card">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Turn</th><th>Endpointing</th><th>STT final</th><th>LLM 1st token</th><th>TTS 1st byte</th><th>Pipeline</th><th>Voice-to-voice</th><th>Barge-in stop</th></tr></thead>
+        <tbody id="turns"></tbody>
+        <tfoot id="summary"></tfoot>
+      </table>
+    </div>
+    <p class="note">Voice-to-voice = end of your speech → first agent audio leaving the server (includes the silence wait). Pipeline = the same minus the silence wait. Target: 800 ms voice-to-voice.</p>
+  </div>
+  <p class="note" id="end"></p>
+</main>
+
+<script>
+const IN_RATE = 16000, OUT_RATE = 24000, LEAD_S = 0.12, TARGET = 800;
+const $ = (id) => document.getElementById(id);
+let ws, micCtx, micStream, workletNode, outCtx, playhead = 0, sources = [], partialEl = null;
+
+const workletSource = `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.ratio = sampleRate / ${IN_RATE}; this.pos = 0; this.prev = 0; this.out = []; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    let peak = 0;
+    // Linear-interpolation resampler to 16 kHz (browser echo cancellation runs before this)
+    while (this.pos < ch.length) {
+      const i = Math.floor(this.pos), f = this.pos - i;
+      const a = i === 0 ? this.prev : ch[i - 1], b = ch[i];
+      const v = a + (b - a) * f;
+      peak = Math.max(peak, Math.abs(v));
+      this.out.push(Math.max(-1, Math.min(1, v)) * 32767);
+      this.pos += this.ratio;
+    }
+    this.pos -= ch.length;
+    this.prev = ch[ch.length - 1];
+    if (this.out.length >= ${IN_RATE / 50}) {           // 20 ms frames
+      const pcm = Int16Array.from(this.out.splice(0, ${IN_RATE / 50}));
+      this.port.postMessage({ pcm: pcm.buffer, peak }, [pcm.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);`;
+
+function setState(s) { $('state').textContent = s; $('state').dataset.s = s; }
+
+function addMsg(who, text, cls) {
+  const box = $('transcript');
+  if (box.querySelector('.note')) box.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'msg';
+  el.innerHTML = `<div class="who">${who}</div><div class="${cls || ''}"></div>`;
+  el.lastChild.textContent = text;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+  return el;
+}
+
+function playPcm(buffer) {
+  const pcm = new Int16Array(buffer);
+  const audio = outCtx.createBuffer(1, pcm.length, OUT_RATE);
+  const data = audio.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) data[i] = pcm[i] / 32768;
+  const src = outCtx.createBufferSource();
+  src.buffer = audio;
+  src.connect(outCtx.destination);
+  const now = outCtx.currentTime;
+  if (playhead < now) playhead = now + LEAD_S;
+  src.start(playhead);
+  playhead += audio.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter((s) => s !== src); };
+}
+
+function clearPlayback() {
+  for (const s of sources) { try { s.stop(); } catch {} }
+  sources = [];
+  playhead = 0;
+}
+
+const fmt = (v) => v === undefined || v === null ? '–' : Math.round(v);
+function latencyRow(label, l, isSummary) {
+  const v2v = l.voiceToVoiceMs;
+  const cls = v2v === undefined ? '' : v2v <= TARGET ? 'good' : 'slow';
+  return `<tr${isSummary ? ' style="font-weight:600"' : ''}><td>${label}</td><td>${fmt(l.endpointingMs)}</td><td>${fmt(l.sttFinalMs)}</td><td>${fmt(l.llmFirstTokenMs)}</td><td>${fmt(l.ttsFirstByteMs)}</td><td>${fmt(l.pipelineMs)}</td><td class="${cls}">${fmt(v2v)}</td><td>${fmt(l.bargeInStopMs)}</td></tr>`;
+}
+
+function onEvent(e) {
+  switch (e.type) {
+    case 'state': setState(e.state); break;
+    case 'clear': clearPlayback(); break;
+    case 'transcript':
+      if (e.role === 'user') {
+        if (!e.final) { if (!partialEl) partialEl = addMsg('you', '', 'partial'); partialEl.lastChild.textContent = e.text; }
+        else { if (partialEl) partialEl.remove(); partialEl = null; addMsg('you', e.text); }
+      } else if (e.final) {
+        const el = addMsg('agent', e.text);
+        if (e.interrupted) el.insertAdjacentHTML('beforeend', '<div class="cut">interrupted, history keeps only what you heard</div>');
+      }
+      break;
+    case 'turn':
+      if (e.turn.kind === 'reply') $('turns').insertAdjacentHTML('beforeend', latencyRow(`#${e.turn.index}${e.turn.interrupted ? ' ✂' : ''}`, e.turn.latency));
+      break;
+    case 'error': addMsg('error', `${e.stage}: ${e.message}`, 'err'); break;
+    case 'transfer': addMsg('system', `Transfer requested to ${e.destination.name} (${e.destination.target})`); break;
+    case 'ended': {
+      const s = e.summary;
+      const p = (m) => s.latency[m];
+      $('summary').innerHTML = latencyRow('p50', Object.fromEntries(Object.keys(s.latency).map((k) => [k, p(k).p50])), true)
+        + latencyRow('p95', Object.fromEntries(Object.keys(s.latency).map((k) => [k, p(k).p95])), true);
+      const used = (s.usage || []).map((u) => `${u.component}: ${u.provider}/${u.model}${u.fallback ? ' (fallback)' : ''} [${u.billing}-billed]`).join(' · ');
+      $('end').textContent = `Call ended: ${e.reason}${s.error ? ` (${s.error.stage}: ${s.error.message})` : ''}. Duration ${(s.durationMs / 1000).toFixed(1)} s. ${used}`;
+      break;
+    }
+  }
+}
+
+async function start() {
+  $('start').disabled = true;
+  $('turns').innerHTML = ''; $('summary').innerHTML = ''; $('end').textContent = '';
+  $('transcript').innerHTML = '<p class="note">Connecting…</p>';
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+  } catch (err) {
+    $('transcript').innerHTML = `<p class="err">Microphone unavailable: ${err.message}</p>`;
+    $('start').disabled = false;
+    return;
+  }
+  micCtx = new AudioContext();
+  outCtx = new AudioContext({ sampleRate: OUT_RATE });
+  await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSource], { type: 'application/javascript' })));
+  workletNode = new AudioWorkletNode(micCtx, 'capture');
+  micCtx.createMediaStreamSource(micStream).connect(workletNode);
+
+  const params = new URLSearchParams({ lang: $('lang').value, preset: $('preset').value, greet: $('greet').checked ? '1' : '0', silenceMs: $('silence').value });
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?${params}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('stop').disabled = false; setState('connecting'); };
+  ws.onmessage = (m) => typeof m.data === 'string' ? onEvent(JSON.parse(m.data)) : outCtx && playPcm(m.data);
+  ws.onclose = (ev) => { stop(false); if (ev.reason && ev.reason !== 'call ended') $('end').textContent += ` Socket closed: ${ev.reason}`; };
+  workletNode.port.onmessage = ({ data }) => {
+    $('level').style.width = `${Math.min(100, data.peak * 140)}%`;
+    if (ws.readyState === WebSocket.OPEN) ws.send(data.pcm);
+  };
+}
+
+function stop(sendHangup = true) {
+  if (sendHangup && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'hangup' }));
+    setTimeout(() => ws.close(), 200);
+  }
+  micStream?.getTracks().forEach((t) => t.stop());
+  micCtx?.close(); micCtx = null;
+  // Our hang-up cuts audio now; when the server ends the call, let the goodbye finish playing
+  if (sendHangup) clearPlayback();
+  const ctx = outCtx;
+  const remainingMs = ctx ? Math.max(0, (playhead - ctx.currentTime) * 1000) : 0;
+  setTimeout(() => ctx?.close(), remainingMs + 100);
+  outCtx = null;
+  $('start').disabled = false; $('stop').disabled = true; $('level').style.width = '0';
+}
+
+$('start').onclick = start;
+$('stop').onclick = () => stop(true);
+</script>
+</body>
+</html>

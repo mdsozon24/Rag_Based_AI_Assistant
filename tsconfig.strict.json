@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "paths": { "@/*": ["./*"], "@octo/web": ["./packages/sdk/src/index.ts"] }
+  },
+  "files": ["apps/dashboard/e2e/api-server.ts"],
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "examples/react/**/*.ts", "examples/react/**/*.tsx", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist", "apps/dashboard"]
+}

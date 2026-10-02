@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice of Octo: custom button example</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; line-height: 1.5; }
+    button { font: inherit; min-height: 44px; padding: 0 16px; }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 12px; min-height: 120px; margin-top: 16px; }
+    #error { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <h1>Bring your own UI</h1>
+  <p>The same SDK without the widget: your own buttons, the transcript in your own markup.</p>
+  <button id="start" type="button">Start call</button>
+  <button id="mute" type="button" aria-pressed="false" disabled>Mute</button>
+  <button id="stop" type="button" disabled>End call</button>
+  <p id="status" role="status" aria-live="polite">Idle</p>
+  <p id="error" role="alert"></p>
+  <div id="log" role="log" aria-live="polite"></div>
+
+  <script type="module">
+    import { VoiceClient } from 'https://api.your-domain.com/sdk/octo-web.js';
+
+    const client = new VoiceClient({ publicKey: 'pk_your_public_key', apiUrl: 'https://api.your-domain.com' });
+    const $ = (id) => document.getElementById(id);
+
+    client.on('status', (status) => {
+      $('status').textContent = status;
+      const live = status === 'active' || status === 'reconnecting';
+      $('start').disabled = live || status === 'connecting';
+      $('mute').disabled = $('stop').disabled = !live;
+    });
+    client.on('message', (message) => {
+      if (message.type !== 'transcript' || !message.final) return;
+      const line = document.createElement('p');
+      line.textContent = `${message.role === 'user' ? 'You' : 'Agent'}: ${message.text}`;
+      $('log').append(line);
+    });
+    client.on('error', (error) => ($('error').textContent = error.message));
+    client.on('call-end', ({ reason }) => ($('status').textContent = `ended (${reason})`));
+
+    $('start').onclick = () => {
+      $('error').textContent = '';
+      client.start('your_assistant_id', { variables: { customer_name: 'Ada' } }).catch(() => {});
+    };
+    $('mute').onclick = () => {
+      client.setMuted(!client.isMuted);
+      $('mute').setAttribute('aria-pressed', String(client.isMuted));
+      $('mute').textContent = client.isMuted ? 'Unmute' : 'Mute';
+    };
+    $('stop').onclick = () => client.stop();
+  </script>
+</body>
+</html>
