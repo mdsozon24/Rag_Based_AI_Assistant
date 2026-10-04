@@ -1,0 +1,3 @@
+module.exports=[71711,a=>{"use strict";a.s(["AppShell",()=>b]);let b=(0,a.i(14331).registerClientReference)(function(){throw Error("Attempted to call AppShell() from the server but AppShell is on the client. It's not possible to invoke a client function from the server, it can only be rendered as a Component or passed to props of a Client Component.")},"[project]/apps/dashboard/src/components/shell/app-shell.tsx","AppShell")},81469,a=>{"use strict";var b=a.i(71711);a.n(b)},77774,a=>{"use strict";var b=a.i(15669),c=a.i(81469);a.s(["default",0,function({children:a}){return(0,b.jsx)(c.AppShell,{children:a})}])},63351,function(a){a.n(a.i(77774))}];
+
+//# sourceMappingURL=apps_dashboard_src_10y61y1._.js.map
