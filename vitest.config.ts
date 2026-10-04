@@ -1,6 +1,5 @@
 import { defineConfig } from 'vitest/config';
 
-// Separate from vite.config.ts so the web app's plugins are not loaded for tests.
 export default defineConfig({
   test: {
     include: ['packages/**/*.test.ts', 'apps/**/*.test.ts'],
