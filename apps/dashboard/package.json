@@ -5,9 +5,9 @@
   "description": "Voice of Octo customer dashboard (Next.js). Talks only to the public /v1 API.",
   "type": "module",
   "scripts": {
-    "dev": "next dev --port 3000",
-    "build": "next build",
-    "start": "next start --port 3000",
+    "dev": "node init && next dev --port 3000",
+    "build": "node init && next build",
+    "start": "node init && next start --port 3000",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit && eslint . --max-warnings 0",
     "test": "vitest run",

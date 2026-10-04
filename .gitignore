@@ -1,4 +1,3 @@
-.env
 data/users.json
 data/sessions.json
 data/voice_settings.json
@@ -10,6 +9,10 @@ packages/sdk/e2e/.tmp/
 test-results/
 playwright-report/
 .next/
+.next-e2e/
+.venv/
+.venv-*/
 next-env.d.ts
 *.tsbuildinfo
 apps/dashboard/e2e/.tmp/
+config.bat

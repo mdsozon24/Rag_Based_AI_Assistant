@@ -11,9 +11,16 @@
     ".": "./dist/octo-web.js",
     "./widget": "./dist/widget.js"
   },
-  "files": ["dist", "src", "README.md"],
-  "sideEffects": ["./src/widget/embed.ts", "./dist/widget.js"],
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "sideEffects": [
+    "./src/widget/embed.ts",
+    "./dist/widget.js"
+  ],
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2020 --sourcemap --outfile=dist/octo-web.js && esbuild src/widget/embed.ts --bundle --format=iife --platform=browser --target=es2020 --minify --sourcemap --outfile=dist/widget.js"
+    "build": "node init && esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2020 --sourcemap --outfile=dist/octo-web.js && esbuild src/widget/embed.ts --bundle --format=iife --platform=browser --target=es2020 --minify --sourcemap --outfile=dist/widget.js"
   }
 }
